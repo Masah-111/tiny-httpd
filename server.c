@@ -59,6 +59,11 @@
   #include <openssl/err.h>
 #endif
 
+/* gzip 圧縮（zlib がある環境でのみ有効化するコンパイル時オプション）*/
+#ifdef USE_GZIP
+  #include <zlib.h>
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -88,6 +93,8 @@
 #define MAX_QUEUE_DEPTH        8192       /* epoll: ワークキュー上限（洪水時の load shedding）*/
 #define MAX_HEADERS            64         /* ヘッダ行数の上限（超えたら 431）*/
 #define MAX_RANGES             16         /* 1リクエストで受け付ける Range の数の上限 */
+#define GZIP_MAX_SIZE          (4LL << 20) /* gzip 対象にする最大ファイルサイズ 4MB */
+#define CACHE_MAX_AGE          3600       /* Cache-Control / Expires の秒数 */
 #define PATH_BUF               4096
 #define SERVER_NAME            "tiny-httpd/0.4 (SATO MASAHIRO)"
 
@@ -189,20 +196,66 @@ static void conn_close(conn_t *c) {
 /* ---------------------------------------------------------------------------
  * 小道具: MIME判定 / HTTP日付 / ヘッダ取得 / URLデコード / パス検査
  * ------------------------------------------------------------------------- */
-static const char *content_type_of(const char *path) {
+/* 拡張子 → MIME タイプの表。compressible=1 のものだけ gzip の対象にする
+ * （画像・動画・zip などは既に圧縮済みなので、再圧縮しても CPU の無駄）。*/
+typedef struct { const char *ext, *mime; int compressible; } mime_entry;
+static const mime_entry MIME_TABLE[] = {
+    /* テキスト系（圧縮が効く）*/
+    { ".html", "text/html; charset=utf-8",             1 },
+    { ".htm",  "text/html; charset=utf-8",             1 },
+    { ".css",  "text/css; charset=utf-8",              1 },
+    { ".js",   "text/javascript; charset=utf-8",       1 },
+    { ".mjs",  "text/javascript; charset=utf-8",       1 },
+    { ".json", "application/json; charset=utf-8",      1 },
+    { ".map",  "application/json; charset=utf-8",      1 },
+    { ".txt",  "text/plain; charset=utf-8",            1 },
+    { ".md",   "text/markdown; charset=utf-8",         1 },
+    { ".csv",  "text/csv; charset=utf-8",              1 },
+    { ".xml",  "application/xml; charset=utf-8",       1 },
+    { ".svg",  "image/svg+xml",                        1 },
+    { ".wasm", "application/wasm",                     1 },
+    /* 画像（多くは圧縮済み）*/
+    { ".png",  "image/png",                            0 },
+    { ".jpg",  "image/jpeg",                           0 },
+    { ".jpeg", "image/jpeg",                           0 },
+    { ".gif",  "image/gif",                            0 },
+    { ".webp", "image/webp",                           0 },
+    { ".avif", "image/avif",                           0 },
+    { ".bmp",  "image/bmp",                            1 },
+    { ".ico",  "image/x-icon",                         0 },
+    /* フォント */
+    { ".woff", "font/woff",                            0 },
+    { ".woff2","font/woff2",                           0 },
+    { ".ttf",  "font/ttf",                             1 },
+    { ".otf",  "font/otf",                             1 },
+    /* 音声・動画 */
+    { ".mp4",  "video/mp4",                            0 },
+    { ".webm", "video/webm",                           0 },
+    { ".ogg",  "audio/ogg",                            0 },
+    { ".mp3",  "audio/mpeg",                           0 },
+    { ".wav",  "audio/wav",                            0 },
+    /* その他 */
+    { ".pdf",  "application/pdf",                      0 },
+    { ".zip",  "application/zip",                      0 },
+    { ".gz",   "application/gzip",                     0 },
+};
+
+static const mime_entry *mime_lookup(const char *path) {
     const char *dot = strrchr(path, '.');
-    if (!dot) return "application/octet-stream";
-    if (!HDRNCMP(dot, ".html", 6) || !HDRNCMP(dot, ".htm", 5)) return "text/html; charset=utf-8";
-    if (!HDRNCMP(dot, ".css", 5))  return "text/css; charset=utf-8";
-    if (!HDRNCMP(dot, ".js", 4))   return "text/javascript; charset=utf-8";
-    if (!HDRNCMP(dot, ".json", 6)) return "application/json; charset=utf-8";
-    if (!HDRNCMP(dot, ".txt", 5))  return "text/plain; charset=utf-8";
-    if (!HDRNCMP(dot, ".svg", 5))  return "image/svg+xml";
-    if (!HDRNCMP(dot, ".png", 5))  return "image/png";
-    if (!HDRNCMP(dot, ".jpg", 5) || !HDRNCMP(dot, ".jpeg", 6)) return "image/jpeg";
-    if (!HDRNCMP(dot, ".gif", 5))  return "image/gif";
-    if (!HDRNCMP(dot, ".ico", 5))  return "image/x-icon";
-    return "application/octet-stream";
+    if (!dot) return NULL;
+    for (size_t i = 0; i < sizeof(MIME_TABLE) / sizeof(MIME_TABLE[0]); i++) {
+        const char *e = MIME_TABLE[i].ext;
+        if (HDRNCMP(dot, e, strlen(e) + 1) == 0) return &MIME_TABLE[i];
+    }
+    return NULL;
+}
+static const char *content_type_of(const char *path) {
+    const mime_entry *m = mime_lookup(path);
+    return m ? m->mime : "application/octet-stream";
+}
+static int is_compressible(const char *path) {
+    const mime_entry *m = mime_lookup(path);
+    return m ? m->compressible : 0;
 }
 
 /* RFC1123 形式の GMT 日付文字列（例: "Sun, 26 Jul 2026 10:00:00 GMT"）*/
@@ -533,13 +586,25 @@ static int secure_open(const char *path, openfile_t *of) {
 #endif
 }
 
-/* ゼロコピー送信（平文・全体配信のみ）。0=成功 / -1=フォールバックせよ */
-static int send_file_zerocopy(conn_t *c, openfile_t *of) {
-    if (conn_is_tls(c)) return -1;                 /* TLS はゼロコピー不可 */
+/* ゼロコピー送信（平文のみ）。start から len バイトを送る。
+ * Range 応答でも使えるよう、オフセットと長さを取る。0=成功 / -1=フォールバックせよ */
+static int send_file_zerocopy(conn_t *c, openfile_t *of, long long start, long long len) {
+    if (conn_is_tls(c)) return -1;                 /* TLS はゼロコピー不可（暗号化が要るため）*/
+    if (len <= 0) return 0;
 #if defined(_WIN32)
-    return TransmitFile(c->sock, of->h, 0, 0, NULL, NULL, 0) ? 0 : -1;
+    /* TransmitFile はファイルポインタの位置から送るので、先に seek しておく。
+     * 1回で送れる上限があるため、分割して送る。 */
+    of_seek(of, start);
+    long long left = len;
+    while (left > 0) {
+        DWORD chunk = (left > 0x7FFFFFFF) ? 0x7FFFFFFF : (DWORD)left;
+        if (!TransmitFile(c->sock, of->h, chunk, 0, NULL, NULL, 0)) return -1;
+        left -= chunk;
+    }
+    return 0;
 #elif defined(__linux__)
-    off_t off = 0; long long left = of->size;
+    off_t off = (off_t)start;                       /* sendfile はオフセットを直接扱える */
+    long long left = len;
     while (left > 0) {
         ssize_t s = sendfile(c->sock, of->fd, &off, (size_t)left);
         if (s <= 0) return -1;
@@ -547,9 +612,53 @@ static int send_file_zerocopy(conn_t *c, openfile_t *of) {
     }
     return 0;
 #else
-    (void)of; return -1;                            /* 非対応 OS はフォールバック */
+    (void)of; (void)start; return -1;               /* 非対応 OS はフォールバック */
 #endif
 }
+
+/* ---------------------------------------------------------------------------
+ * gzip 圧縮（-DUSE_GZIP のときのみ）。ファイル全体を読み込んで gzip 形式に圧縮する。
+ * zlib の compress() は zlib 形式なので、gzip ヘッダを付けるため deflateInit2 に
+ * windowBits = 15 + 16 を渡す。
+ * 戻り値: 0=成功（*out を呼び出し側が free する）/ -1=失敗（非圧縮で送るべき）
+ * ------------------------------------------------------------------------- */
+#ifdef USE_GZIP
+static int gzip_file(openfile_t *of, unsigned char **out, long long *out_len) {
+    *out = NULL; *out_len = 0;
+    if (of->size <= 0 || of->size > GZIP_MAX_SIZE) return -1;
+
+    unsigned char *raw = (unsigned char *)malloc((size_t)of->size);
+    if (!raw) return -1;
+    of_seek(of, 0);
+    long long got = 0;
+    while (got < of->size) {
+        long n = of_read(of, (char *)raw + got, (long)(of->size - got));
+        if (n <= 0) break;
+        got += n;
+    }
+    if (got != of->size) { free(raw); return -1; }
+
+    z_stream zs;
+    memset(&zs, 0, sizeof zs);
+    if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                     15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) { free(raw); return -1; }
+
+    uLong cap = deflateBound(&zs, (uLong)got);
+    unsigned char *buf = (unsigned char *)malloc(cap);
+    if (!buf) { deflateEnd(&zs); free(raw); return -1; }
+
+    zs.next_in = raw;   zs.avail_in  = (uInt)got;
+    zs.next_out = buf;  zs.avail_out = (uInt)cap;
+    int rc = deflate(&zs, Z_FINISH);
+    long long produced = (long long)zs.total_out;
+    deflateEnd(&zs);
+    free(raw);
+
+    if (rc != Z_STREAM_END) { free(buf); return -1; }
+    *out = buf; *out_len = produced;
+    return 0;
+}
+#endif
 
 /* 通常のバッファ送信（Range スライスにも使う）。開いたハンドルから読む。 */
 static int send_file_buffered(conn_t *c, openfile_t *of, long long start, long long length) {
@@ -643,7 +752,9 @@ static int send_multirange(conn_t *c, openfile_t *of, range_t *r, int n,
     if (!head_only) {
         for (int i = 0; i < n; i++) {
             conn_send_all(c, parthdr[i], (size_t)plen[i]);
-            send_file_buffered(c, of, r[i].start, r[i].end - r[i].start + 1);
+            long long seglen = r[i].end - r[i].start + 1;
+            if (send_file_zerocopy(c, of, r[i].start, seglen) != 0)   /* 各パートもゼロコピー */
+                send_file_buffered(c, of, r[i].start, seglen);
         }
         conn_send_all(c, closing, (size_t)clen);
     }
@@ -660,9 +771,27 @@ static int serve_file(conn_t *c, const char *fs_path, const char *hdrs,
     long long size = of.size;
     char lastmod[64]; http_date(of.mtime, lastmod, sizeof lastmod);
     char date[64];    http_date(time(NULL), date, sizeof date);
-    char etag[64];
-    snprintf(etag, sizeof etag, "\"%llx-%llx\"",
-             (unsigned long long)size, (unsigned long long)of.mtime);
+
+    /* --- gzip を使うかを先に決める（ETag が変わるため、条件付きGET より前）---
+     * Range 要求時は圧縮しない（範囲は元の表現に対する指定なので混ぜると壊れる）。*/
+    int want_gzip = 0;
+    int compressible = is_compressible(fs_path);
+    char aebuf[128];
+    int client_accepts_gzip = (header_get(hdrs, "Accept-Encoding", aebuf, sizeof aebuf) &&
+                               strstr(aebuf, "gzip") != NULL);
+    int has_range = (header_get(hdrs, "Range", aebuf, sizeof aebuf) != 0);
+#ifdef USE_GZIP
+    want_gzip = (compressible && client_accepts_gzip && !has_range &&
+                 size > 0 && size <= GZIP_MAX_SIZE);
+#else
+    (void)client_accepts_gzip; (void)has_range;   /* gzip 無効ビルドでは使わない */
+#endif
+
+    /* ETag は「表現」ごとに異なる必要がある → gzip 版は接尾辞を付ける */
+    char etag[72];
+    snprintf(etag, sizeof etag, "\"%llx-%llx%s\"",
+             (unsigned long long)size, (unsigned long long)of.mtime,
+             want_gzip ? "-gz" : "");
 
     /* --- (D) 条件付きGET → 304 Not Modified --- */
     int not_modified = 0;
@@ -673,16 +802,46 @@ static int serve_file(conn_t *c, const char *fs_path, const char *hdrs,
         time_t ims = parse_http_date(cond);                    /* 日付を実際にパースして比較 */
         if (ims != (time_t)-1 && of.mtime <= ims) not_modified = 1;
     }
+    /* 圧縮しうる資源は Vary を必ず付ける（キャッシュが別表現を混同しないように）*/
+    const char *vary = compressible ? "Vary: Accept-Encoding\r\n" : "";
+
     if (not_modified) {
         char header[512];
         int hlen = snprintf(header, sizeof(header),
             "HTTP/1.1 304 Not Modified\r\n"
-            "Date: %s\r\nServer: %s\r\nETag: %s\r\nLast-Modified: %s\r\n%s\r\n",
-            date, SERVER_NAME, etag, lastmod, conn_hdr(keep_alive));
+            "Date: %s\r\nServer: %s\r\nETag: %s\r\nLast-Modified: %s\r\n%s%s\r\n",
+            date, SERVER_NAME, etag, lastmod, vary, conn_hdr(keep_alive));
         conn_send_all(c, header, (size_t)hlen);
         of_close(&of);
         return 304;
     }
+
+    /* --- gzip 応答（圧縮できたときだけ。失敗したら通常経路へ落ちる）--- */
+#ifdef USE_GZIP
+    if (want_gzip) {
+        unsigned char *gz = NULL; long long gzlen = 0;
+        if (gzip_file(&of, &gz, &gzlen) == 0) {
+            char expires[64]; http_date(time(NULL) + CACHE_MAX_AGE, expires, sizeof expires);
+            char header[768];
+            int hlen = snprintf(header, sizeof(header),
+                "HTTP/1.1 200 OK\r\n"
+                "Date: %s\r\nServer: %s\r\nContent-Type: %s\r\n"
+                "Content-Encoding: gzip\r\nContent-Length: %lld\r\n"
+                "ETag: %s\r\nLast-Modified: %s\r\n"
+                "Cache-Control: max-age=%d\r\nExpires: %s\r\n%s%s\r\n",
+                date, SERVER_NAME, content_type_of(fs_path), gzlen,
+                etag, lastmod, CACHE_MAX_AGE, expires, vary, conn_hdr(keep_alive));
+            conn_send_all(c, header, (size_t)hlen);
+            if (!head_only) conn_send_all(c, (const char *)gz, (size_t)gzlen);
+            free(gz);
+            of_close(&of);
+            return 200;
+        }
+        /* 圧縮に失敗 → 非圧縮で送る。ETag も非 gzip 版に戻す */
+        snprintf(etag, sizeof etag, "\"%llx-%llx\"",
+                 (unsigned long long)size, (unsigned long long)of.mtime);
+    }
+#endif
 
     /* --- (E) Range（複数対応 / If-Range 対応）--- */
     range_t ranges[MAX_RANGES];
@@ -728,7 +887,8 @@ static int serve_file(conn_t *c, const char *fs_path, const char *hdrs,
     long long body_len = is_range ? (end - start + 1) : size;
     int  status   = is_range ? 206 : 200;
 
-    char header[768];
+    char expires[64]; http_date(time(NULL) + CACHE_MAX_AGE, expires, sizeof expires);
+    char header[900];
     int hlen;
     if (is_range) {
         hlen = snprintf(header, sizeof(header),
@@ -736,28 +896,27 @@ static int serve_file(conn_t *c, const char *fs_path, const char *hdrs,
             "Date: %s\r\nServer: %s\r\nContent-Type: %s\r\n"
             "Content-Length: %lld\r\nContent-Range: bytes %lld-%lld/%lld\r\n"
             "Accept-Ranges: bytes\r\nETag: %s\r\nLast-Modified: %s\r\n"
-            "Cache-Control: max-age=3600\r\n%s\r\n",
+            "Cache-Control: max-age=%d\r\nExpires: %s\r\n%s%s\r\n",
             date, SERVER_NAME, content_type_of(fs_path),
-            body_len, start, end, size, etag, lastmod, conn_hdr(keep_alive));
+            body_len, start, end, size, etag, lastmod,
+            CACHE_MAX_AGE, expires, vary, conn_hdr(keep_alive));
     } else {
         hlen = snprintf(header, sizeof(header),
             "HTTP/1.1 200 OK\r\n"
             "Date: %s\r\nServer: %s\r\nContent-Type: %s\r\n"
             "Content-Length: %lld\r\nAccept-Ranges: bytes\r\n"
-            "ETag: %s\r\nLast-Modified: %s\r\nCache-Control: max-age=3600\r\n%s\r\n",
+            "ETag: %s\r\nLast-Modified: %s\r\n"
+            "Cache-Control: max-age=%d\r\nExpires: %s\r\n%s%s\r\n",
             date, SERVER_NAME, content_type_of(fs_path),
-            body_len, etag, lastmod, conn_hdr(keep_alive));
+            body_len, etag, lastmod, CACHE_MAX_AGE, expires, vary, conn_hdr(keep_alive));
     }
     conn_send_all(c, header, (size_t)hlen);
 
     /* --- 本文送信 --- */
     if (!head_only && body_len > 0) {
-        /* (G) 全体配信かつ平文なら、まずゼロコピーを試す（失敗したら通常送信）*/
-        if (!is_range && send_file_zerocopy(c, &of) == 0) {
-            /* ゼロコピー成功 */
-        } else {
+        /* (G) 平文なら Range でもゼロコピーを試す（失敗したら通常送信にフォールバック）*/
+        if (send_file_zerocopy(c, &of, start, body_len) != 0)
             send_file_buffered(c, &of, start, body_len);
-        }
     }
     of_close(&of);
     return status;
