@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (portable / thread-per-connection)
+        run: gcc server.c -o server -lpthread -Wall -Wextra -O2
+
+      - name: Build (epoll / C10K edition)
+        run: gcc server.c -o server_epoll -DUSE_EPOLL -lpthread -Wall -Wextra -O2
+
+      - name: Build (TLS / compile check)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev
+          gcc server.c -o server_tls -DUSE_TLS -lssl -lcrypto -lpthread -Wall -Wextra -O2
+
+      - name: Integration tests (portable)
+        run: bash tests/run_tests.sh
+
+      - name: Integration tests (epoll edition)
+        env:
+          USE_EPOLL: "1"
+          PORT: "8972"
+        run: bash tests/run_tests.sh

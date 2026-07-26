@@ -1,0 +1,4 @@
+# 改行は常に LF に統一する。
+# シェルスクリプトが CRLF になると Linux / WSL / CI で実行できなくなるため。
+* text=auto eol=lf
+*.sh text eol=lf

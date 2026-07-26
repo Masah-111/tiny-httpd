@@ -1,0 +1,9 @@
+# build artifacts
+*.exe
+*.o
+*.obj
+a.out
+server
+server_posix
+server_epoll
+*.pem

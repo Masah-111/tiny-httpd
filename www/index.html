@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>tiny-httpd — 自作HTTPサーバ</title>
+<style>
+  body{font-family:"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif;
+       background:#0f1420;color:#e6ebf2;line-height:1.8;margin:0;padding:0}
+  .wrap{max-width:720px;margin:0 auto;padding:64px 24px}
+  .badge{display:inline-block;font-family:Consolas,monospace;font-size:.8rem;
+         color:#7dd3fc;background:#12233a;border:1px solid #1e3a5f;padding:6px 12px;border-radius:6px}
+  h1{font-size:2rem;margin:22px 0 8px}
+  .accent{color:#60a5fa}
+  p{color:#a9b4c2}
+  .card{background:#161d2b;border:1px solid #263349;border-radius:8px;padding:24px;margin-top:28px}
+  code{font-family:Consolas,monospace;color:#7dd3fc}
+  .flow{font-family:Consolas,monospace;font-size:.85rem;color:#8b97a8;margin-top:8px}
+  a{color:#60a5fa}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <span class="badge">SERVED BY C · NO FRAMEWORK</span>
+    <h1>このページは<span class="accent">自作のHTTPサーバ</span>が返しています</h1>
+    <p>
+      あなたのブラウザがいま表示しているこのHTMLは、Apache でも nginx でもなく、
+      C言語で TCP ソケットから書き起こした <code>tiny-httpd</code> が配信しています。
+    </p>
+    <div class="card">
+      <strong>いま起きたこと（HTTPの流れ）</strong>
+      <p class="flow">
+        ブラウザ → TCP接続 (3ウェイハンドシェイク)<br>
+        → "GET / HTTP/1.1" を送信<br>
+        → サーバがリクエストをパース<br>
+        → www/index.html を読み、ステータス行＋ヘッダ＋本文を返す<br>
+        → ブラウザが描画
+      </p>
+    </div>
+    <div class="card">
+      <strong>実装しているもの</strong>
+      <p>GET / HEAD・静的ファイル配信・Content-Type判定・パストラバーサル防御・
+      200/400/403/404/405 応答。すべて標準ライブラリのみ。</p>
+    </div>
+    <p style="margin-top:32px;font-size:.85rem">
+      ソースコード: <a href="https://github.com/Masah-111">github.com/Masah-111</a>
+    </p>
+  </div>
+</body>
+</html>
