@@ -224,7 +224,7 @@ gcc server.c -o server_epoll -DUSE_EPOLL -lpthread
 > ※このエディションは TLS 非対応（TLS はノンブロッキングなハンドシェイクが必要で、本エディションの
 > スコープ外）。`-DUSE_EPOLL` と `-DUSE_TLS` の同時指定はビルド時にエラーにしている。
 
-## 非ブロッキング状態機械（`-DUSE_NONBLOCK` / Linux）
+## 非ブロッキング状態機械（`-DUSE_NONBLOCK` / Linux・macOS・BSD）
 
 epoll + スレッドプール版には弱点がある。「読める」と通知された接続をワーカーが**ブロッキングで**
 読み切るため、**1 バイトずつ極端に遅く送る相手が、ワーカー 1 本を占有できてしまう**。
@@ -244,6 +244,20 @@ epoll + スレッドプール版には弱点がある。「読める」と通知
 gcc server.c -o server_nonblock -DUSE_NONBLOCK -lpthread   # または make nonblock
 ./server_nonblock 8080
 ```
+
+### イベント通知の移植（epoll と kqueue）
+
+「このソケットが読める／書けるようになったら教えて」という道具は OS ごとに違う。
+
+| | Linux | macOS・BSD |
+|---|---|---|
+| API | `epoll` | `kqueue` |
+| 登録の考え方 | 1 つの構造体に興味のあるイベントをまとめて登録し直す | 読み・書きが**独立したフィルタ**で、それぞれ有効/無効にする |
+| `sendfile` | `sendfile(out, in, &off, count)` | 引数の順も戻り値の意味も異なる（部分送信量を別引数で返す）|
+
+これらを `ev_create` / `ev_add` / `ev_mod` / `ev_del` / `ev_wait` と `nb_sendfile` の裏に隠したので、
+**リアクター本体は 1 つのコードのまま両対応**になっている。CI では macOS ランナーで
+kqueue 版をビルドし、統合テストと Slowloris 耐性まで検証している。
 
 ### 実測: Slowloris への耐性
 
@@ -345,7 +359,8 @@ accept したソケットに `TCP_NODELAY` を設定して解消した。同一�
 - [x] ~~キャッシュ対応（ETag / Last-Modified / 条件付き GET）~~（v0.3 で実装）
 - [x] ~~Range リクエスト~~（v0.3 で実装）
 - [x] ~~`epoll` によるイベント駆動 + スレッドプール（C10K 対応）~~（v0.4 で実装・Linux）
-- [ ] `kqueue`(BSD/macOS) / IOCP(Windows) 対応で C10K をクロスプラットフォーム化
+- [x] ~~`kqueue`(macOS/BSD) 対応~~（非ブロッキング版で対応・CI の macOS ランナーで検証）
+- [ ] IOCP(Windows) 対応（完了通知型でモデルが根本的に違うため、別実装が必要）
 - [x] ~~ノンブロッキング I/O による状態機械化（Slowloris を 1 スレッドも使わず捌く）~~（実装・実測済み）
 - [x] ~~HTTP パイプライン対応~~（非ブロッキング版で対応）
 - [ ] gzip 圧縮（`Content-Encoding`）

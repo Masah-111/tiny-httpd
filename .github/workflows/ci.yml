@@ -121,6 +121,45 @@ jobs:
       - name: Fuzz malformed requests under sanitizers
         run: BIN=./server_asan PORT=8992 ITER=1500 bash tests/fuzz.sh
 
+  macos-kqueue:
+    name: kqueue reactor on macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the portable edition
+        run: gcc server.c -o server -Wall -Wextra -Werror -O2 -lpthread
+      - name: Build the non-blocking reactor (kqueue backend)
+        run: gcc server.c -o server_nb -DUSE_NONBLOCK -Wall -Wextra -Werror -O2 -lpthread
+      - name: Confirm it selects kqueue
+        run: |
+          ./server_nb 8971 &
+          sleep 1
+          curl -s -o /dev/null -w 'GET / -> %{http_code}\n' http://127.0.0.1:8971/
+          kill %1
+      - name: Integration tests against the kqueue reactor
+        run: BIN=./server_nb PORT=8972 bash tests/run_tests.sh
+      - name: Stay responsive under 200 Slowloris connections
+        run: |
+          TINYHTTPD_BURST=0 ./server_nb 8973 &
+          SRV=$!
+          sleep 1
+          python3 - <<'PY'
+          import socket, sys, time
+          held = []
+          for _ in range(200):
+              s = socket.create_connection(("127.0.0.1", 8973), timeout=2)
+              s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n")
+              held.append(s)
+          time.sleep(1)
+          c = socket.create_connection(("127.0.0.1", 8973), timeout=5)
+          c.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+          c.settimeout(5)
+          status = c.recv(32).split(b"\r\n")[0].decode()
+          print("held:", len(held), "| response under attack:", status)
+          sys.exit(0 if status.endswith("200 OK") else 1)
+          PY
+          kill $SRV
+
   tls-e2e:
     name: HTTPS end-to-end
     runs-on: ubuntu-latest

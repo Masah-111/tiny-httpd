@@ -91,13 +91,28 @@
 #include <signal.h>            /* graceful shutdown（SIGINT / SIGTERM）*/
 #include <stdatomic.h>         /* 同時接続数カウンタ（スレッド安全）*/
 
-/* 非ブロッキング状態機械版（-DUSE_NONBLOCK）。epoll の仕組みを土台にするので
- * USE_EPOLL を自動的に有効化する。 */
-#if defined(USE_NONBLOCK) && !defined(USE_EPOLL)
-  #define USE_EPOLL 1
+/* 非ブロッキング状態機械版（-DUSE_NONBLOCK）。
+ * イベント通知の仕組みは OS ごとに違うので、epoll(Linux) と kqueue(macOS/BSD) を
+ * 同じ内部インタフェースの裏に隠して使い分ける。 */
+#ifdef USE_NONBLOCK
+  #if defined(__linux__)
+    #define EV_BACKEND_EPOLL 1
+    #include <sys/epoll.h>
+  #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    #define EV_BACKEND_KQUEUE 1
+    #include <sys/event.h>
+    #include <sys/uio.h>          /* macOS/BSD の sendfile */
+  #else
+    #error "USE_NONBLOCK requires epoll (Linux) or kqueue (macOS/BSD)."
+  #endif
+  #if defined(USE_TLS)
+    #error "USE_NONBLOCK and USE_TLS are not supported together (TLS needs a non-blocking handshake; out of scope)."
+  #endif
 #endif
-#if defined(USE_NONBLOCK) && !defined(__linux__)
-  #error "USE_NONBLOCK requires Linux (it is built on epoll)."
+
+/* macOS には MSG_NOSIGNAL が無い。SIGPIPE は main で無視しているので 0 で構わない。 */
+#ifndef MSG_NOSIGNAL
+  #define MSG_NOSIGNAL 0
 #endif
 
 /* epoll + スレッドプール版（C10K エディション、Linux 専用のコンパイル時オプション）*/
@@ -1662,8 +1677,8 @@ static int handle_one_request(conn_t *c) {
 }
 
 /* thread-per-connection 方式: 1接続を専有スレッドで keep-alive ループ処理
- * （epoll エディションでは pool_worker が代わりを務めるので不要）*/
-#if !defined(USE_EPOLL)
+ * （イベント駆動版では pool_worker / リアクターが代わりを務めるので不要）*/
+#if !defined(USE_EPOLL) && !defined(USE_NONBLOCK)
 static void handle_connection(conn_t *c) {
     while (handle_one_request(c)) { }
 }
@@ -1689,7 +1704,7 @@ static SSL_CTX *tls_setup(const char *cert_file, const char *key_file) {
 /* ===========================================================================
  * (A) 接続ごとのワーカースレッド（thread-per-connection 方式）
  * ========================================================================= */
-#if !defined(USE_EPOLL)
+#if !defined(USE_EPOLL) && !defined(USE_NONBLOCK)
 #ifdef _WIN32
 static unsigned __stdcall worker(void *arg)
 #else
@@ -1726,12 +1741,12 @@ static void *worker(void *arg)
  *   => 1万の待機接続は epoll に預けるだけでスレッドを消費しない。実際にI/Oが
  *      来た接続だけがワーカーを使う。これが thread-per-connection との決定的な差。
  * ========================================================================= */
-#if defined(__linux__) && defined(USE_EPOLL)
+#if (defined(__linux__) && defined(USE_EPOLL)) || defined(USE_NONBLOCK)
 
 #define MAX_EPOLL_EVENTS 1024
-static int g_epfd = -1;
 
 #ifndef USE_NONBLOCK   /* 以下のワークキューとプールは非ブロッキング版では使わない */
+static int g_epfd = -1;
 
 /* ---- ワークキュー（FIFO・mutex+condvar）---- */
 typedef struct qnode { conn_t *conn; struct qnode *next; } qnode;
@@ -1794,6 +1809,130 @@ static void epoll_drop(conn_t *c) {
  * スレッドは 1 本も止まらない。だから単一スレッドで大量の接続を捌ける。
  * ========================================================================= */
 #ifdef USE_NONBLOCK
+
+/* ---------------------------------------------------------------------------
+ * イベント通知の抽象化: epoll(Linux) と kqueue(macOS/BSD) を同じ顔で使う
+ * ---------------------------------------------------------------------------
+ * どちらも「このソケットが読める/書けるようになったら教えて」という道具だが、
+ * API の形が違う:
+ *   epoll  … 1つの構造体に興味のあるイベントをまとめて登録し直す
+ *   kqueue … 読み・書きをそれぞれ独立した「フィルタ」として有効/無効にする
+ * 下のラッパで違いを吸収し、リアクター本体は 1 つのコードで両対応にする。
+ * ------------------------------------------------------------------------- */
+static int g_evfd = -1;                       /* epoll fd もしくは kqueue fd */
+
+typedef struct { void *ptr; int readable, writable, error; } ev_result;
+
+static int ev_create(void) {
+#ifdef EV_BACKEND_EPOLL
+    return epoll_create1(0);
+#else
+    return kqueue();
+#endif
+}
+
+/* fd を監視対象に加える。want_write=0 なら読みのみ、1 なら書きのみ監視する。 */
+static int ev_add(int fd, void *ptr, int want_write) {
+#ifdef EV_BACKEND_EPOLL
+    struct epoll_event ev;
+    ev.events = want_write ? EPOLLOUT : EPOLLIN;
+    ev.data.ptr = ptr;
+    return epoll_ctl(g_evfd, EPOLL_CTL_ADD, fd, &ev);
+#else
+    struct kevent kev[2];
+    /* kqueue は読み/書きが別フィルタなので、要らない方は明示的に無効化する */
+    EV_SET(&kev[0], fd, EVFILT_READ,  want_write ? EV_DELETE : EV_ADD, 0, 0, ptr);
+    EV_SET(&kev[1], fd, EVFILT_WRITE, want_write ? EV_ADD : EV_DELETE, 0, 0, ptr);
+    /* まだ登録されていないフィルタの EV_DELETE は ENOENT になるが無害なので無視する */
+    kevent(g_evfd, &kev[0], 1, NULL, 0, NULL);
+    kevent(g_evfd, &kev[1], 1, NULL, 0, NULL);
+    /* 実際に必要な方が登録できたかだけを確認する */
+    EV_SET(&kev[0], fd, want_write ? EVFILT_WRITE : EVFILT_READ, EV_ADD, 0, 0, ptr);
+    return kevent(g_evfd, &kev[0], 1, NULL, 0, NULL);
+#endif
+}
+static int ev_mod(int fd, void *ptr, int want_write) {
+#ifdef EV_BACKEND_EPOLL
+    struct epoll_event ev;
+    ev.events = want_write ? EPOLLOUT : EPOLLIN;
+    ev.data.ptr = ptr;
+    return epoll_ctl(g_evfd, EPOLL_CTL_MOD, fd, &ev);
+#else
+    return ev_add(fd, ptr, want_write);        /* kqueue は EV_ADD が登録も更新も兼ねる */
+#endif
+}
+static void ev_del(int fd) {
+#ifdef EV_BACKEND_EPOLL
+    epoll_ctl(g_evfd, EPOLL_CTL_DEL, fd, NULL);
+#else
+    struct kevent kev[2];
+    EV_SET(&kev[0], fd, EVFILT_READ,  EV_DELETE, 0, 0, NULL);
+    EV_SET(&kev[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+    kevent(g_evfd, kev, 2, NULL, 0, NULL);
+#endif
+}
+
+/* イベントを待つ。timeout_ms 経過で 0 件でも戻る。 */
+static int ev_wait(ev_result *out, int max, int timeout_ms) {
+#ifdef EV_BACKEND_EPOLL
+    struct epoll_event evs[MAX_EPOLL_EVENTS];
+    if (max > MAX_EPOLL_EVENTS) max = MAX_EPOLL_EVENTS;
+    int n = epoll_wait(g_evfd, evs, max, timeout_ms);
+    for (int i = 0; i < n && i < max; i++) {
+        out[i].ptr      = evs[i].data.ptr;
+        out[i].readable = (evs[i].events & EPOLLIN)  != 0;
+        out[i].writable = (evs[i].events & EPOLLOUT) != 0;
+        out[i].error    = (evs[i].events & (EPOLLHUP | EPOLLERR)) != 0;
+    }
+    return n;
+#else
+    struct kevent evs[MAX_EPOLL_EVENTS];
+    if (max > MAX_EPOLL_EVENTS) max = MAX_EPOLL_EVENTS;
+    struct timespec ts, *tp = NULL;
+    if (timeout_ms >= 0) {
+        ts.tv_sec = timeout_ms / 1000;
+        ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
+        tp = &ts;
+    }
+    int n = kevent(g_evfd, NULL, 0, evs, max, tp);
+    for (int i = 0; i < n && i < max; i++) {
+        out[i].ptr      = evs[i].udata;
+        out[i].readable = (evs[i].filter == EVFILT_READ);
+        out[i].writable = (evs[i].filter == EVFILT_WRITE);
+        out[i].error    = (evs[i].flags & EV_EOF) && (evs[i].filter == EVFILT_READ)
+                          ? 0 : ((evs[i].flags & EV_ERROR) != 0);
+    }
+    return n;
+#endif
+}
+
+/* 非ブロッキングな sendfile。OS ごとに引数の形がまるで違うのでここで吸収する。
+ * 戻り値: 送れたバイト数（0 以上）/ -1 = エラー（errno を見る）
+ * 部分送信でも「送れた分」を返すので、呼び出し側は残りを次回に回せる。 */
+static ssize_t nb_sendfile(int sock, int fd, long long off, long long count) {
+#if defined(__linux__)
+    off_t o = (off_t)off;
+    return sendfile(sock, fd, &o, (size_t)count);
+#elif defined(__APPLE__)
+    off_t len = (off_t)count;                  /* 入力=送りたい量, 出力=送れた量 */
+    int rc = sendfile(fd, sock, (off_t)off, &len, NULL, 0);
+    if (rc == 0 || (rc < 0 && (errno == EAGAIN || errno == EINTR))) return (ssize_t)len;
+    return -1;
+#elif defined(__FreeBSD__)
+    off_t sent = 0;
+    int rc = sendfile(fd, sock, (off_t)off, (size_t)count, NULL, &sent, 0);
+    if (rc == 0 || (rc < 0 && (errno == EAGAIN || errno == EINTR))) return (ssize_t)sent;
+    return -1;
+#else
+    /* sendfile が無い環境向けの手動コピー（OpenBSD/NetBSD 等）*/
+    char buf[65536];
+    size_t want = (count < (long long)sizeof buf) ? (size_t)count : sizeof buf;
+    if (lseek(fd, (off_t)off, SEEK_SET) < 0) return -1;
+    ssize_t r = read(fd, buf, want);
+    if (r <= 0) return -1;
+    return send(sock, buf, (size_t)r, MSG_NOSIGNAL);
+#endif
+}
 
 /* rbuf に完全なリクエストが入ったか。1=揃った / 0=まだ / -1=不正か大きすぎ */
 static int request_complete(conn_t *c) {
@@ -1884,10 +2023,10 @@ static int nb_flush(conn_t *c) {
         return -1;
     }
     while (c->wfile && c->wfile_left > 0) {
-        off_t off = (off_t)c->wfile_off;
-        ssize_t n = sendfile(c->sock, c->wfile->fd, &off, (size_t)c->wfile_left);
-        if (n > 0) { c->wfile_off = (long long)off; c->wfile_left -= n; continue; }
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        ssize_t n = nb_sendfile(c->sock, c->wfile->fd, c->wfile_off, c->wfile_left);
+        if (n > 0) { c->wfile_off += n; c->wfile_left -= n; continue; }
+        if (n == 0) return 0;                            /* 今は送れない（次回に回す）*/
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
         return -1;
     }
     return 1;
@@ -1940,18 +2079,16 @@ static void nb_unlink(conn_t *c) {
     c->prev = c->next = NULL;
 }
 static void nb_drop(conn_t *c) {
-    epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->sock, NULL);
+    ev_del(c->sock);
     nb_unlink(c);
     nb_free(c);
     conn_close(c);
     free(c);
     atomic_fetch_sub(&g_conns, 1);
 }
-static int nb_arm(conn_t *c, uint32_t events) {
-    struct epoll_event ev;
-    ev.events = events;
-    ev.data.ptr = c;
-    return epoll_ctl(g_epfd, EPOLL_CTL_MOD, c->sock, &ev);
+/* want_write=0 なら「読める」を、1 なら「書ける」を待つように切り替える */
+static int nb_arm(conn_t *c, int want_write) {
+    return ev_mod(c->sock, c, want_write);
 }
 
 /* 揃ったリクエストを処理し、応答を wbuf/wfile に組み立てる。
@@ -1976,34 +2113,39 @@ static int nb_process(conn_t *c) {
         if (c->want_close) { nb_drop(c); return -1; }
         nb_reset_after_response(c);
         if (request_complete(c) == 1) return nb_process(c);   /* パイプライン */
-        if (nb_arm(c, EPOLLIN) != 0) { nb_drop(c); return -1; }
+        if (nb_arm(c, 0) != 0) { nb_drop(c); return -1; }     /* また読みを待つ */
     } else {                                       /* 続きは書けるようになってから */
-        if (nb_arm(c, EPOLLOUT) != 0) { nb_drop(c); return -1; }
+        if (nb_arm(c, 1) != 0) { nb_drop(c); return -1; }
     }
     return 0;
 }
 
 static void run_epoll(sock_t listen_sock) {
     set_nonblocking(listen_sock);
-    g_epfd = epoll_create1(0);
-    if (g_epfd < 0) { perror("epoll_create1"); return; }
+    g_evfd = ev_create();
+    if (g_evfd < 0) { perror("event backend"); return; }
 
-    struct epoll_event lev;
-    lev.events = EPOLLIN;
-    lev.data.ptr = NULL;                            /* NULL = listen ソケットの目印 */
-    epoll_ctl(g_epfd, EPOLL_CTL_ADD, listen_sock, &lev);
-    printf("concurrency: single-threaded non-blocking reactor (epoll)\n\n");
+    if (ev_add(listen_sock, NULL, 0) != 0) {        /* NULL = listen ソケットの目印 */
+        perror("ev_add(listen)"); return;
+    }
+    printf("concurrency: single-threaded non-blocking reactor (%s)\n\n",
+#ifdef EV_BACKEND_EPOLL
+           "epoll"
+#else
+           "kqueue"
+#endif
+    );
     fflush(stdout);
 
-    struct epoll_event evs[MAX_EPOLL_EVENTS];
+    ev_result evs[MAX_EPOLL_EVENTS];
     time_t last_sweep = time(NULL);
 
     while (!g_stop) {
-        int n = epoll_wait(g_epfd, evs, MAX_EPOLL_EVENTS, 1000);   /* 1秒ごとに掃除もする */
+        int n = ev_wait(evs, MAX_EPOLL_EVENTS, 1000);   /* 1秒ごとに掃除もする */
         if (n < 0) { if (errno == EINTR) continue; break; }
 
         for (int i = 0; i < n; i++) {
-            if (evs[i].data.ptr == NULL) {
+            if (evs[i].ptr == NULL) {
                 /* --- listen 可読: たまった接続をすべて受け付ける --- */
                 for (;;) {
                     struct sockaddr_in6 cli; socklen_t cl = sizeof(cli);
@@ -2018,9 +2160,7 @@ static void run_epoll(sock_t listen_sock) {
                     c->buffering = 1;               /* 以後 conn_send_all は wbuf へ */
                     c->deadline = time(NULL) + IO_TIMEOUT_SEC;
                     format_peer(&cli, c->ip, sizeof(c->ip));
-                    struct epoll_event ev;
-                    ev.events = EPOLLIN; ev.data.ptr = c;
-                    if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, client, &ev) != 0) {
+                    if (ev_add(client, c, 0) != 0) {        /* まず「読める」を待つ */
                         close(client); free(c);
                     } else {
                         nb_link(c);
@@ -2030,12 +2170,12 @@ static void run_epoll(sock_t listen_sock) {
                 continue;
             }
 
-            conn_t *c = (conn_t *)evs[i].data.ptr;
+            conn_t *c = (conn_t *)evs[i].ptr;
             c->deadline = time(NULL) + IO_TIMEOUT_SEC;   /* 動きがあったので延長 */
 
-            if (evs[i].events & (EPOLLHUP | EPOLLERR)) { nb_drop(c); continue; }
+            if (evs[i].error) { nb_drop(c); continue; }
 
-            if (evs[i].events & EPOLLIN) {
+            if (evs[i].readable) {
                 /* --- 読めるだけ読む（EAGAIN が返るまで）--- */
                 int closed = 0;
                 for (;;) {
@@ -2057,14 +2197,14 @@ static void run_epoll(sock_t listen_sock) {
                 if (closed && !nb_has_output(c)) { nb_drop(c); continue; }
             }
 
-            if (evs[i].events & EPOLLOUT) {
+            if (evs[i].writable) {
                 int f = nb_flush(c);
                 if (f < 0) { nb_drop(c); continue; }
                 if (f == 1) {
                     if (c->want_close) { nb_drop(c); continue; }
                     nb_reset_after_response(c);
                     if (request_complete(c) == 1) { if (nb_process(c) < 0) continue; }
-                    else if (nb_arm(c, EPOLLIN) != 0) { nb_drop(c); continue; }
+                    else if (nb_arm(c, 0) != 0) { nb_drop(c); continue; }
                 }
             }
         }
@@ -2236,8 +2376,8 @@ int main(int argc, char **argv) {
     printf("SIGINT/SIGTERM to stop gracefully.\n");
     fflush(stdout);   /* ログをファイルへリダイレクトしても起動状況がすぐ見えるように */
 
-#if defined(__linux__) && defined(USE_EPOLL)
-    /* C10K エディション: epoll + スレッドプール */
+#if (defined(__linux__) && defined(USE_EPOLL)) || defined(USE_NONBLOCK)
+    /* イベント駆動版（epoll+プール、または非ブロッキング状態機械）*/
     run_epoll(listen_sock);
 #else
     /* 標準エディション: accept ごとに専有スレッドを起動（thread-per-connection）*/
