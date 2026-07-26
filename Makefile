@@ -2,6 +2,7 @@
 #
 #   make              … 標準版（thread-per-connection）
 #   make epoll        … C10K 版（epoll + スレッドプール / Linux 専用）
+#   make nonblock     … 非ブロッキング状態機械（単一スレッド / Linux 専用）
 #   make tls          … TLS 版（要 OpenSSL）
 #   make gzip         … gzip 圧縮つき（要 zlib）
 #   make all-variants … 上記をまとめてビルド（CI 用）
@@ -34,13 +35,16 @@ $(BIN): $(SRC)
 epoll: $(SRC)
 	$(CC) $(CFLAGS) -DUSE_EPOLL $(SRC) -o server_epoll $(LDLIBS_BASE)
 
+nonblock: $(SRC)
+	$(CC) $(CFLAGS) -DUSE_NONBLOCK $(SRC) -o server_nonblock $(LDLIBS_BASE)
+
 tls: $(SRC)
 	$(CC) $(CFLAGS) -DUSE_TLS $(SRC) -o server_tls $(LDLIBS_BASE) -lssl -lcrypto
 
 gzip: $(SRC)
 	$(CC) $(CFLAGS) -DUSE_GZIP $(SRC) -o server_gzip $(LDLIBS_BASE) -lz
 
-all-variants: all epoll tls gzip
+all-variants: all epoll nonblock tls gzip
 
 test: all
 	bash tests/run_tests.sh
@@ -58,4 +62,4 @@ analyze: $(SRC)
 	$(CC) $(CFLAGS) -fanalyzer -c $(SRC) -o /dev/null
 
 clean:
-	rm -f server server.exe server_epoll server_tls server_gzip server_asan *.o
+	rm -f server server.exe server_epoll server_nonblock server_tls server_gzip server_asan *.o

@@ -91,6 +91,15 @@
 #include <signal.h>            /* graceful shutdown（SIGINT / SIGTERM）*/
 #include <stdatomic.h>         /* 同時接続数カウンタ（スレッド安全）*/
 
+/* 非ブロッキング状態機械版（-DUSE_NONBLOCK）。epoll の仕組みを土台にするので
+ * USE_EPOLL を自動的に有効化する。 */
+#if defined(USE_NONBLOCK) && !defined(USE_EPOLL)
+  #define USE_EPOLL 1
+#endif
+#if defined(USE_NONBLOCK) && !defined(__linux__)
+  #error "USE_NONBLOCK requires Linux (it is built on epoll)."
+#endif
+
 /* epoll + スレッドプール版（C10K エディション、Linux 専用のコンパイル時オプション）*/
 #if defined(__linux__) && defined(USE_EPOLL)
   #include <sys/epoll.h>
@@ -157,12 +166,31 @@ static int        g_max_conns = 10000;        /* 同時接続の上限（環境�
 /* ===========================================================================
  * 接続の抽象化: 平文でも TLS でも同じ conn_recv/conn_send で扱う
  * ========================================================================= */
-typedef struct {
+/* 非ブロッキング版で使う「送信待ちのファイル」情報の前方宣言用 */
+#ifdef USE_NONBLOCK
+struct openfile_s;
+#endif
+
+typedef struct conn_s {
     sock_t sock;
     char   ip[46];
     int    reqcount;      /* この接続で処理したリクエスト数（keep-alive 上限管理）*/
 #ifdef USE_TLS
     SSL *ssl;
+#endif
+#ifdef USE_NONBLOCK
+    struct conn_s *prev, *next;            /* 生存中の接続をつなぐ双方向リスト */
+    time_t     deadline;                   /* この時刻を過ぎて無音なら回収する */
+    /* --- 非ブロッキング状態機械のための接続ごとの状態 ---
+     * 読み: リクエストが揃うまで rbuf に貯める（socket は一切ブロックしない）
+     * 書き: 応答を wbuf に組み立て、大きな本文はファイルのまま wfile から流す */
+    char      *rbuf;  size_t rlen, rcap;   /* 受信中のリクエスト */
+    size_t     rconsumed;                  /* handle_one_request が読み進めた位置 */
+    char      *wbuf;  size_t wlen, wcap, wsent;  /* 送信待ちのバイト列（ヘッダ等）*/
+    struct openfile_s *wfile;              /* wbuf の後に流すファイル（無ければ NULL）*/
+    long long  wfile_off, wfile_left;      /* ファイルの送信位置と残り */
+    int        want_close;                 /* 送信し切ったら閉じるか */
+    int        buffering;                  /* 1 = conn_send_all を wbuf へ振り向ける */
 #endif
 } conn_t;
 
@@ -197,6 +225,8 @@ static void set_tcp_nodelay(sock_t s) {
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&yes, sizeof(yes));
 }
 
+/* 非ブロッキング版では socket 自体を非ブロッキングにし、期限は自前で管理するため使わない */
+#ifndef USE_NONBLOCK
 static void set_io_timeout(sock_t s, int seconds) {
 #ifdef _WIN32
     DWORD ms = (DWORD)seconds * 1000;
@@ -208,14 +238,48 @@ static void set_io_timeout(sock_t s, int seconds) {
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
 }
+#endif /* !USE_NONBLOCK */
+
+#ifdef USE_NONBLOCK
+/* 動的バッファへの追記（容量が足りなければ倍々に伸ばす）。0=成功 / -1=メモリ不足 */
+static int buf_append(char **bufp, size_t *len, size_t *cap, const char *src, size_t n) {
+    if (*len + n > *cap) {
+        size_t ncap = *cap ? *cap : 4096;
+        while (ncap < *len + n) ncap *= 2;
+        char *nb = (char *)realloc(*bufp, ncap);
+        if (!nb) return -1;
+        *bufp = nb; *cap = ncap;
+    }
+    memcpy(*bufp + *len, src, n);
+    *len += n;
+    return 0;
+}
+#endif
 
 static int conn_recv(conn_t *c, char *buf, int len) {
+#ifdef USE_NONBLOCK
+    /* 非ブロッキング版では、リクエストは事前に rbuf へ читать込み済み。
+     * ここでは socket を触らず、貯めた分から切り出して返す（絶対にブロックしない）。*/
+    if (c->buffering) {
+        size_t avail = c->rlen - c->rconsumed;
+        if (avail == 0) return 0;                 /* これ以上は無い＝相手が送り終えている */
+        size_t take = ((size_t)len < avail) ? (size_t)len : avail;
+        memcpy(buf, c->rbuf + c->rconsumed, take);
+        c->rconsumed += take;
+        return (int)take;
+    }
+#endif
 #ifdef USE_TLS
     if (c->ssl) return SSL_read(c->ssl, buf, len);
 #endif
     return recv(c->sock, buf, len, 0);
 }
 static int conn_send_all(conn_t *c, const char *buf, size_t len) {
+#ifdef USE_NONBLOCK
+    /* 非ブロッキング版では socket へ直接書かず、送信待ちバッファへ積むだけ。
+     * 実際の送出は epoll が「書ける」と言ったときに少しずつ行う。 */
+    if (c->buffering) return buf_append(&c->wbuf, &c->wlen, &c->wcap, buf, len);
+#endif
     size_t sent = 0;
     while (sent < len) {
         int n;
@@ -706,7 +770,7 @@ static void send_error(conn_t *c, int code, const char *status, int keep_alive) 
  *   「サイズ・更新日時の取得」も「本文の読み出し」も、この“開いたハンドル”で行う。
  *   検査したパスと実際に読むファイルが必ず同一実体になり、検査後の差し替えを防ぐ。
  * ------------------------------------------------------------------------- */
-typedef struct {
+typedef struct openfile_s {
 #ifdef _WIN32
     HANDLE h;
 #else
@@ -795,6 +859,10 @@ static int secure_open(const char *path, openfile_t *of) {
 static int send_file_zerocopy(conn_t *c, openfile_t *of, long long start, long long len) {
     if (conn_is_tls(c)) return -1;                 /* TLS はゼロコピー不可（暗号化が要るため）*/
     if (len <= 0) return 0;
+#ifdef USE_NONBLOCK
+    /* 非ブロッキング版はここで socket へ書いてはいけない（呼び出し側がバッファへ回す）*/
+    if (c->buffering) return -1;
+#endif
 #if defined(_WIN32)
     /* TransmitFile はファイルポインタの位置から送るので、先に seek しておく。
      * 1回で送れる上限があるため、分割して送る。 */
@@ -1217,6 +1285,23 @@ static int serve_file(conn_t *c, const char *fs_path, const char *hdrs,
     conn_send_all(c, header, (size_t)hlen);
 
     /* --- 本文送信 --- */
+#ifdef USE_NONBLOCK
+    /* 非ブロッキング版: 本文はここで送らず、開いたファイルを接続に預ける。
+     * 実際の送出は epoll が「書ける」と言うたびに sendfile で少しずつ進める。
+     * ファイルの所有権が接続に移るので、ここでは閉じない。 */
+    if (c->buffering) {
+        if (!head_only && body_len > 0) {
+            openfile_t *held = (openfile_t *)malloc(sizeof *held);
+            if (held) {
+                *held = of;
+                c->wfile = held; c->wfile_off = start; c->wfile_left = body_len;
+                return status;
+            }
+        }
+        of_close(&of);
+        return status;
+    }
+#endif
     if (!head_only && body_len > 0) {
         /* (G) 平文なら Range でもゼロコピーを試す（失敗したら通常送信にフォールバック）*/
         if (send_file_zerocopy(c, &of, start, body_len) != 0)
@@ -1646,6 +1731,8 @@ static void *worker(void *arg)
 #define MAX_EPOLL_EVENTS 1024
 static int g_epfd = -1;
 
+#ifndef USE_NONBLOCK   /* 以下のワークキューとプールは非ブロッキング版では使わない */
+
 /* ---- ワークキュー（FIFO・mutex+condvar）---- */
 typedef struct qnode { conn_t *conn; struct qnode *next; } qnode;
 static qnode *g_qhead = NULL, *g_qtail = NULL;
@@ -1691,6 +1778,123 @@ static void epoll_drop(conn_t *c) {
     atomic_fetch_sub(&g_conns, 1);
 }
 
+#endif /* !USE_NONBLOCK（ワークキューとプールここまで）*/
+
+/* ===========================================================================
+ * 非ブロッキング状態機械（-DUSE_NONBLOCK）
+ * ---------------------------------------------------------------------------
+ * 通常の epoll 版は「読める」と言われた接続をワーカーがブロッキングで読み切る。
+ * そのため 1 バイトずつ極端に遅く送る相手が、ワーカーを最大 IO_TIMEOUT_SEC 占有できる。
+ *
+ * この版では socket を一切ブロックさせない:
+ *   読み  … リクエストが揃うまで rbuf に貯め、揃った時点で初めて処理する
+ *   処理  … conn_send_all が wbuf へ積むだけになる（socket に触れない）
+ *   書き  … epoll が「書ける」と言うたびに wbuf → wfile の順で少しずつ送る
+ * 送れない・届いていない場合は即座に epoll へ戻るので、遅い相手が居ても
+ * スレッドは 1 本も止まらない。だから単一スレッドで大量の接続を捌ける。
+ * ========================================================================= */
+#ifdef USE_NONBLOCK
+
+/* rbuf に完全なリクエストが入ったか。1=揃った / 0=まだ / -1=不正か大きすぎ */
+static int request_complete(conn_t *c) {
+    if (!c->rbuf || c->rlen == 0) return 0;
+    c->rbuf[c->rlen] = '\0';                       /* 常に NUL 終端を保つ */
+    char *hend = strstr(c->rbuf, "\r\n\r\n");
+    if (!hend) return (c->rlen >= REQ_BUF_SIZE) ? -1 : 0;   /* ヘッダが長すぎる */
+
+    size_t head_len = (size_t)(hend + 4 - c->rbuf);
+    char *line_end = strstr(c->rbuf, "\r\n");
+    const char *hdrs = line_end ? line_end + 2 : hend;
+    size_t body_have = c->rlen - head_len;
+
+    char te[64], cl[32];
+    if (header_get(hdrs, "Transfer-Encoding", te, sizeof te)) {
+        /* chunked 以外の転送コーディング（501）や、Content-Length との併存（400 スマグリング）は
+         * 本文を待たずに処理側へ渡す。ここで待つと応答が返せなくなる。 */
+        if (HDRNCMP(te, "chunked", 7) != 0) return 1;
+        if (header_get(hdrs, "Content-Length", cl, sizeof cl)) return 1;
+        /* chunked: 終端チャンク "0\r\n" とその後の空行まで来ているかを調べる */
+        const char *p = c->rbuf + head_len;
+        const char *end = c->rbuf + c->rlen;
+        long long total = 0;
+        for (;;) {
+            const char *nl = (const char *)memchr(p, '\n', (size_t)(end - p));
+            if (!nl) return (c->rlen > MAX_BODY_SIZE + REQ_BUF_SIZE) ? -1 : 0;
+            char sz[32];
+            size_t ll = (size_t)(nl - p) + 1;
+            size_t cp = ll < sizeof sz ? ll : sizeof sz - 1;
+            memcpy(sz, p, cp); sz[cp] = '\0';
+            char *ep = NULL;
+            long long csize = strtoll(sz, &ep, 16);
+            if (ep == sz || csize < 0) return -1;
+            p = nl + 1;
+            if (csize == 0) {                       /* 終端チャンク → 空行まで */
+                const char *t = strstr(p, "\r\n");
+                return t ? 1 : 0;
+            }
+            total += csize;
+            if (total > MAX_BODY_SIZE) return -1;
+            if ((long long)(end - p) < csize + 2) return 0;   /* データ＋CRLF 待ち */
+            p += csize + 2;
+        }
+    }
+    if (header_get(hdrs, "Content-Length", cl, sizeof cl)) {
+        long long n = atoll(cl);
+        if (n < 0) return 1;                        /* 不正値は処理側で 400 にさせる */
+        if (n > MAX_BODY_SIZE) return 1;            /* 上限超も処理側で 413 にさせる */
+        return (body_have >= (size_t)n) ? 1 : 0;
+    }
+    return 1;                                        /* 本文なし */
+}
+
+/* 応答を送り終えた／次のリクエストに備えて状態を戻す */
+static void nb_reset_after_response(conn_t *c) {
+    free(c->wbuf); c->wbuf = NULL; c->wlen = c->wcap = c->wsent = 0;
+    if (c->wfile) { of_close(c->wfile); free(c->wfile); c->wfile = NULL; }
+    c->wfile_off = c->wfile_left = 0;
+    /* 使い切ったリクエストを捨て、パイプラインで先読みした分は前へ詰める */
+    if (c->rbuf) {
+        if (c->rconsumed < c->rlen) {
+            memmove(c->rbuf, c->rbuf + c->rconsumed, c->rlen - c->rconsumed);
+            c->rlen -= c->rconsumed;
+        } else {
+            c->rlen = 0;
+        }
+    }
+    c->rconsumed = 0;
+}
+
+static void nb_free(conn_t *c) {
+    free(c->rbuf); c->rbuf = NULL; c->rlen = c->rcap = c->rconsumed = 0;
+    free(c->wbuf); c->wbuf = NULL; c->wlen = c->wcap = c->wsent = 0;
+    if (c->wfile) { of_close(c->wfile); free(c->wfile); c->wfile = NULL; }
+}
+
+/* 送信待ちが残っているか */
+static int nb_has_output(conn_t *c) {
+    return (c->wsent < c->wlen) || (c->wfile && c->wfile_left > 0);
+}
+
+/* 送れるだけ送る。1=送り切った / 0=まだ残っている / -1=接続が壊れた */
+static int nb_flush(conn_t *c) {
+    while (c->wsent < c->wlen) {
+        ssize_t n = send(c->sock, c->wbuf + c->wsent, c->wlen - c->wsent, MSG_NOSIGNAL);
+        if (n > 0) { c->wsent += (size_t)n; continue; }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;  /* 続きは次回 */
+        return -1;
+    }
+    while (c->wfile && c->wfile_left > 0) {
+        off_t off = (off_t)c->wfile_off;
+        ssize_t n = sendfile(c->sock, c->wfile->fd, &off, (size_t)c->wfile_left);
+        if (n > 0) { c->wfile_off = (long long)off; c->wfile_left -= n; continue; }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        return -1;
+    }
+    return 1;
+}
+#endif /* USE_NONBLOCK */
+
+#ifndef USE_NONBLOCK
 /* ---- プールのワーカー: キューから取り出して1リクエスト処理し、再武装 or 閉じる ---- */
 static void *pool_worker(void *arg) {
     (void)arg;
@@ -1709,11 +1913,179 @@ static void *pool_worker(void *arg) {
     }
     return NULL;
 }
+#endif /* !USE_NONBLOCK */
 
 static void set_nonblocking(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
+
+#ifdef USE_NONBLOCK
+/* ---------------------------------------------------------------------------
+ * 非ブロッキング版のイベントループ（単一スレッドのリアクター）
+ * ---------------------------------------------------------------------------
+ * スレッドを 1 本も止めないので、ワーカープールすら要らない。
+ * 遅い相手・沈黙する相手が何万居ても、このスレッドは回り続ける。
+ * ------------------------------------------------------------------------- */
+static conn_t *g_live = NULL;                   /* 生存中の接続リスト（先頭）*/
+
+static void nb_link(conn_t *c) {
+    c->prev = NULL; c->next = g_live;
+    if (g_live) g_live->prev = c;
+    g_live = c;
+}
+static void nb_unlink(conn_t *c) {
+    if (c->prev) c->prev->next = c->next; else g_live = c->next;
+    if (c->next) c->next->prev = c->prev;
+    c->prev = c->next = NULL;
+}
+static void nb_drop(conn_t *c) {
+    epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->sock, NULL);
+    nb_unlink(c);
+    nb_free(c);
+    conn_close(c);
+    free(c);
+    atomic_fetch_sub(&g_conns, 1);
+}
+static int nb_arm(conn_t *c, uint32_t events) {
+    struct epoll_event ev;
+    ev.events = events;
+    ev.data.ptr = c;
+    return epoll_ctl(g_epfd, EPOLL_CTL_MOD, c->sock, &ev);
+}
+
+/* 揃ったリクエストを処理し、応答を wbuf/wfile に組み立てる。
+ * 戻り値: 0=続行 / -1=接続を落とした */
+static int nb_process(conn_t *c) {
+    while (request_complete(c) == 1) {
+        c->rconsumed = 0;
+        int keep = handle_one_request(c);          /* 内部の送信はすべて wbuf へ積まれる */
+        c->want_close = !keep;
+        if (nb_has_output(c) || c->want_close) break;
+        nb_reset_after_response(c);                /* 応答が無い場合（通常起きない）*/
+    }
+    int rc = request_complete(c);
+    if (rc == -1) {                                /* 壊れている・大きすぎる */
+        c->want_close = 1;
+        send_error(c, 400, "Bad Request", 0);
+    }
+    if (!nb_has_output(c)) return 0;               /* まだ送るものが無い */
+    int f = nb_flush(c);
+    if (f < 0) { nb_drop(c); return -1; }
+    if (f == 1) {                                  /* 一度で送り切れた */
+        if (c->want_close) { nb_drop(c); return -1; }
+        nb_reset_after_response(c);
+        if (request_complete(c) == 1) return nb_process(c);   /* パイプライン */
+        if (nb_arm(c, EPOLLIN) != 0) { nb_drop(c); return -1; }
+    } else {                                       /* 続きは書けるようになってから */
+        if (nb_arm(c, EPOLLOUT) != 0) { nb_drop(c); return -1; }
+    }
+    return 0;
+}
+
+static void run_epoll(sock_t listen_sock) {
+    set_nonblocking(listen_sock);
+    g_epfd = epoll_create1(0);
+    if (g_epfd < 0) { perror("epoll_create1"); return; }
+
+    struct epoll_event lev;
+    lev.events = EPOLLIN;
+    lev.data.ptr = NULL;                            /* NULL = listen ソケットの目印 */
+    epoll_ctl(g_epfd, EPOLL_CTL_ADD, listen_sock, &lev);
+    printf("concurrency: single-threaded non-blocking reactor (epoll)\n\n");
+    fflush(stdout);
+
+    struct epoll_event evs[MAX_EPOLL_EVENTS];
+    time_t last_sweep = time(NULL);
+
+    while (!g_stop) {
+        int n = epoll_wait(g_epfd, evs, MAX_EPOLL_EVENTS, 1000);   /* 1秒ごとに掃除もする */
+        if (n < 0) { if (errno == EINTR) continue; break; }
+
+        for (int i = 0; i < n; i++) {
+            if (evs[i].data.ptr == NULL) {
+                /* --- listen 可読: たまった接続をすべて受け付ける --- */
+                for (;;) {
+                    struct sockaddr_in6 cli; socklen_t cl = sizeof(cli);
+                    int client = accept(listen_sock, (struct sockaddr *)&cli, &cl);
+                    if (client < 0) break;
+                    if (atomic_load(&g_conns) >= g_max_conns) { close(client); continue; }
+                    set_nonblocking(client);        /* ここが肝: socket を非ブロッキングに */
+                    set_tcp_nodelay(client);
+                    conn_t *c = (conn_t *)calloc(1, sizeof(conn_t));
+                    if (!c) { close(client); continue; }
+                    c->sock = client;
+                    c->buffering = 1;               /* 以後 conn_send_all は wbuf へ */
+                    c->deadline = time(NULL) + IO_TIMEOUT_SEC;
+                    format_peer(&cli, c->ip, sizeof(c->ip));
+                    struct epoll_event ev;
+                    ev.events = EPOLLIN; ev.data.ptr = c;
+                    if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, client, &ev) != 0) {
+                        close(client); free(c);
+                    } else {
+                        nb_link(c);
+                        atomic_fetch_add(&g_conns, 1);
+                    }
+                }
+                continue;
+            }
+
+            conn_t *c = (conn_t *)evs[i].data.ptr;
+            c->deadline = time(NULL) + IO_TIMEOUT_SEC;   /* 動きがあったので延長 */
+
+            if (evs[i].events & (EPOLLHUP | EPOLLERR)) { nb_drop(c); continue; }
+
+            if (evs[i].events & EPOLLIN) {
+                /* --- 読めるだけ読む（EAGAIN が返るまで）--- */
+                int closed = 0;
+                for (;;) {
+                    if (c->rlen + 4096 + 1 > c->rcap) {
+                        size_t ncap = c->rcap ? c->rcap * 2 : 8192;
+                        while (ncap < c->rlen + 4096 + 1) ncap *= 2;
+                        if (ncap > (size_t)(MAX_BODY_SIZE + 2 * REQ_BUF_SIZE)) { closed = 1; break; }
+                        char *nb = (char *)realloc(c->rbuf, ncap);
+                        if (!nb) { closed = 1; break; }
+                        c->rbuf = nb; c->rcap = ncap;
+                    }
+                    ssize_t got = recv(c->sock, c->rbuf + c->rlen, 4096, 0);
+                    if (got > 0) { c->rlen += (size_t)got; continue; }
+                    if (got == 0) { closed = 1; break; }               /* 相手が閉じた */
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break; /* 今はここまで */
+                    closed = 1; break;
+                }
+                if (nb_process(c) < 0) continue;    /* 落とされた */
+                if (closed && !nb_has_output(c)) { nb_drop(c); continue; }
+            }
+
+            if (evs[i].events & EPOLLOUT) {
+                int f = nb_flush(c);
+                if (f < 0) { nb_drop(c); continue; }
+                if (f == 1) {
+                    if (c->want_close) { nb_drop(c); continue; }
+                    nb_reset_after_response(c);
+                    if (request_complete(c) == 1) { if (nb_process(c) < 0) continue; }
+                    else if (nb_arm(c, EPOLLIN) != 0) { nb_drop(c); continue; }
+                }
+            }
+        }
+
+        /* --- 無音のまま期限を過ぎた接続を回収する ---
+         * 非ブロッキングでは SO_RCVTIMEO が効かないので、自前で面倒を見る。
+         * これで Slowloris は「スレッドを 1 本も奪えないうえ、時間で切られる」ことになる。 */
+        time_t now = time(NULL);
+        if (now != last_sweep) {
+            last_sweep = now;
+            conn_t *p = g_live;
+            while (p) {
+                conn_t *next = p->next;
+                if (p->deadline <= now) nb_drop(p);
+                p = next;
+            }
+        }
+    }
+}
+
+#else  /* ここから従来の epoll + スレッドプール版 */
 
 /* ---- epoll イベントループ本体（accept 専用スレッド兼リアクター）---- */
 static void run_epoll(sock_t listen_sock) {
@@ -1773,6 +2145,7 @@ static void run_epoll(sock_t listen_sock) {
         }
     }
 }
+#endif /* USE_NONBLOCK / スレッドプール版の分岐 */
 #endif /* __linux__ && USE_EPOLL */
 
 /* ===========================================================================

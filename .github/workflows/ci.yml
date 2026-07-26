@@ -27,8 +27,14 @@ jobs:
             libs: "-lpthread -lssl -lcrypto"
           # epoll と TLS は両立しない（TLS はノンブロッキングなハンドシェイクが要る）ので
           # 組み合わせは epoll+gzip と gzip+tls の 2 通りを検証する
+          - variant: nonblock
+            flags: "-DUSE_NONBLOCK"
+            libs: "-lpthread"
           - variant: epoll+gzip
             flags: "-DUSE_EPOLL -DUSE_GZIP"
+            libs: "-lpthread -lz"
+          - variant: nonblock+gzip
+            flags: "-DUSE_NONBLOCK -DUSE_GZIP"
             libs: "-lpthread -lz"
           - variant: gzip+tls
             flags: "-DUSE_GZIP -DUSE_TLS"
@@ -63,6 +69,41 @@ jobs:
         env:
           USE_EPOLL: ${{ matrix.edition == 'epoll' && '1' || '0' }}
         run: bash tests/run_tests.sh
+
+  test-nonblock:
+    name: integration tests + Slowloris resistance (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - name: Build the non-blocking reactor
+        run: gcc server.c -o server_nb -DUSE_NONBLOCK -DUSE_GZIP -Wall -Wextra -Werror -O2 -lpthread -lz
+      - name: Integration tests
+        run: BIN=./server_nb GZIP=1 PORT=8961 bash tests/run_tests.sh
+      - name: Serve normally while 300 Slowloris connections are held open
+        run: |
+          TINYHTTPD_BURST=0 ./server_nb 8962 &
+          SRV=$!
+          sleep 1
+          python3 - <<'PY'
+          import socket, subprocess, sys, time
+          held = []
+          for _ in range(300):
+              s = socket.create_connection(("127.0.0.1", 8962), timeout=2)
+              s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n")   # 途中で沈黙
+              held.append(s)
+          time.sleep(1)
+          c = socket.create_connection(("127.0.0.1", 8962), timeout=5)
+          c.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+          c.settimeout(5)
+          status = c.recv(32).split(b"\r\n")[0].decode()
+          print("held:", len(held), "| response while under attack:", status)
+          sys.exit(0 if status.endswith("200 OK") else 1)
+          PY
+          THREADS=$(ps -o nlwp= -p $SRV | tr -d ' ')
+          echo "server threads: $THREADS"
+          test "$THREADS" -le 2
+          kill $SRV
 
   sanitizers:
     name: tests + fuzzing under ASan/UBSan
