@@ -40,6 +40,7 @@
 #else
   #include <sys/socket.h>
   #include <netinet/in.h>
+  #include <netinet/tcp.h>      /* TCP_NODELAY */
   #include <arpa/inet.h>
   #include <sys/time.h>
   #include <sys/stat.h>
@@ -184,6 +185,16 @@ static void net_cleanup(void) {
 #ifdef _WIN32
     WSACleanup();
 #endif
+}
+
+/* Nagle アルゴリズムを切る。
+ * 応答は「ヘッダを送る → 本文を送る」と 2 回に分けて書くため、Nagle が有効だと
+ * 2 回目の書き込みが相手の ACK を待って止まり、遅延 ACK と噛み合って
+ * 1 リクエストあたり数十ミリ秒の固定遅延が生じる（実測で約 60ms あった）。
+ * HTTP のような要求応答型では NODELAY が正解。 */
+static void set_tcp_nodelay(sock_t s) {
+    int yes = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&yes, sizeof(yes));
 }
 
 static void set_io_timeout(sock_t s, int seconds) {
@@ -1020,7 +1031,8 @@ static int serve_directory(conn_t *c, const char *fs_path, const char *url_path,
         while ((e = readdir(d)) != NULL) {
             if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
             char full[PATH_BUF];
-            snprintf(full, sizeof full, "%s/%s", fs_path, e->d_name);
+            int need = snprintf(full, sizeof full, "%s/%s", fs_path, e->d_name);
+            if (need < 0 || (size_t)need >= sizeof full) continue;   /* 長すぎる名前は飛ばす */
             int dir = is_directory(full);
             char esc[600]; html_escape(e->d_name, esc, sizeof esc);
             if (cap - len < 800) break;
@@ -1711,6 +1723,7 @@ static void run_epoll(sock_t listen_sock) {
                     /* 同時接続数の上限（超過分は即クローズ = load shedding）*/
                     if (atomic_load(&g_conns) >= g_max_conns) { close(client); continue; }
                     set_io_timeout(client, IO_TIMEOUT_SEC);
+                    set_tcp_nodelay(client);
                     conn_t *c = (conn_t *)malloc(sizeof(conn_t));
                     if (!c) { close(client); continue; }
                     c->sock = client; c->reqcount = 0;
@@ -1841,6 +1854,7 @@ int main(int argc, char **argv) {
             atomic_fetch_sub(&g_conns, 1); CLOSESOCK(client); continue;
         }
         set_io_timeout(client, IO_TIMEOUT_SEC);
+        set_tcp_nodelay(client);
 
         conn_t *c = (conn_t *)malloc(sizeof(conn_t));
         if (!c) { CLOSESOCK(client); atomic_fetch_sub(&g_conns, 1); continue; }

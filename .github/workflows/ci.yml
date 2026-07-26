@@ -6,28 +6,97 @@ on:
   pull_request:
 
 jobs:
-  build-and-test:
+  build:
+    name: build (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: portable
+            flags: ""
+            libs: "-lpthread"
+          - variant: epoll
+            flags: "-DUSE_EPOLL"
+            libs: "-lpthread"
+          - variant: gzip
+            flags: "-DUSE_GZIP"
+            libs: "-lpthread -lz"
+          - variant: tls
+            flags: "-DUSE_TLS"
+            libs: "-lpthread -lssl -lcrypto"
+          # epoll と TLS は両立しない（TLS はノンブロッキングなハンドシェイクが要る）ので
+          # 組み合わせは epoll+gzip と gzip+tls の 2 通りを検証する
+          - variant: epoll+gzip
+            flags: "-DUSE_EPOLL -DUSE_GZIP"
+            libs: "-lpthread -lz"
+          - variant: gzip+tls
+            flags: "-DUSE_GZIP -DUSE_TLS"
+            libs: "-lpthread -lz -lssl -lcrypto"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev
+      - name: Compile
+        run: gcc server.c -o server_${{ matrix.variant }} ${{ matrix.flags }} -Wall -Wextra -Werror -O2 ${{ matrix.libs }}
+
+  static-analysis:
+    name: static analysis (gcc -fanalyzer)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev zlib1g-dev
+      - name: Analyze (warnings are errors)
+        run: gcc -fanalyzer -Wall -Wextra -Werror -O2 -DUSE_GZIP -c server.c -o /dev/null
 
-      - name: Build (portable / thread-per-connection)
-        run: gcc server.c -o server -lpthread -Wall -Wextra -O2
-
-      - name: Build (epoll / C10K edition)
-        run: gcc server.c -o server_epoll -DUSE_EPOLL -lpthread -Wall -Wextra -O2
-
-      - name: Build (TLS / compile check)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev
-          gcc server.c -o server_tls -DUSE_TLS -lssl -lcrypto -lpthread -Wall -Wextra -O2
-
-      - name: Integration tests (portable)
-        run: bash tests/run_tests.sh
-
-      - name: Integration tests (epoll edition)
+  test:
+    name: integration tests (${{ matrix.edition }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        edition: [portable, epoll]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - name: Run test suite
         env:
-          USE_EPOLL: "1"
-          PORT: "8972"
+          USE_EPOLL: ${{ matrix.edition == 'epoll' && '1' || '0' }}
         run: bash tests/run_tests.sh
+
+  sanitizers:
+    name: tests + fuzzing under ASan/UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - name: Build with AddressSanitizer and UndefinedBehaviorSanitizer
+        run: |
+          gcc server.c -o server_asan -DUSE_GZIP \
+            -Wall -Wextra -O1 -g -fsanitize=address,undefined \
+            -fno-omit-frame-pointer -lpthread -lz
+      - name: Integration tests under sanitizers
+        run: BIN=./server_asan GZIP=1 PORT=8991 bash tests/run_tests.sh
+      - name: Fuzz malformed requests under sanitizers
+        run: BIN=./server_asan PORT=8992 ITER=1500 bash tests/fuzz.sh
+
+  tls-e2e:
+    name: HTTPS end-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Build TLS variant
+        run: gcc server.c -o server_tls -DUSE_TLS -Wall -Wextra -Werror -O2 -lpthread -lssl -lcrypto
+      - name: Generate a self-signed certificate
+        run: openssl req -x509 -newkey rsa:2048 -nodes -days 1 -keyout key.pem -out cert.pem -subj "/CN=localhost"
+      - name: Serve over HTTPS and verify
+        run: |
+          ./server_tls 8443 cert.pem key.pem &
+          sleep 1
+          echo "TLS version negotiated:"
+          curl -ksv https://127.0.0.1:8443/ 2>&1 | grep -i "SSL connection using" || true
+          test "$(curl -ks -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/)" = "200"
+          test "$(curl -ks -d hello https://127.0.0.1:8443/echo)" = "hello"
+          test "$(curl -ks -o /dev/null -w '%{http_code}' -r 0-4 https://127.0.0.1:8443/index.html)" = "206"
+          echo "HTTPS end-to-end OK"

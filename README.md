@@ -24,6 +24,41 @@ v0.2 で**セキュリティ・堅牢性**、v0.3 で**同時接続・keep-alive
         <──"HTTP/1.1 200 OK" + ヘッダ + HTML──
 ```
 
+## 全体像
+
+リクエストが通る道と、各段で何を弾いているか。
+
+```mermaid
+flowchart TD
+    A[クライアント] -->|TCP 接続| B{並行処理モデル}
+    B -->|標準版| C[接続ごとにスレッド]
+    B -->|-DUSE_EPOLL| D[epoll + スレッドプール<br/>待機接続はスレッドを使わない]
+    C --> E[リクエスト行とヘッダを読む]
+    D --> E
+    E --> F{厳格な検証}
+    F -->|不正なメソッド / 版 / ヘッダ| X1[400 / 431 / 505]
+    F -->|レート超過| X2[429]
+    F -->|TE と CL の併存| X3[400 スマグリング]
+    F --> G{三層パス検査}
+    G -->|字句: .. : 制御文字| X4[403]
+    G -->|正準化して web root 外| X4
+    G -->|開いた実体が web root 外| X4
+    G --> H{条件付き / Range}
+    H -->|ETag・日付が一致| X5[304]
+    H -->|範囲が満たせない| X6[416]
+    H --> I{応答の作り方}
+    I -->|gzip 可| J[圧縮して送る<br/>Vary + 専用 ETag]
+    I -->|Range| K[206 / multipart<br/>ゼロコピー]
+    I -->|全体| L[200<br/>ゼロコピー]
+    J --> M[アクセスログ]
+    K --> M
+    L --> M
+    M -->|keep-alive| E
+```
+
+さらにその外側で、**Landlock サンドボックス**（Linux）がプロセス自体を web root の読み取りだけに閉じ込め、
+**権限降格**で root 権限を捨て、**同時接続数の上限**と**I/O タイムアウト**が資源枯渇を防いでいる。
+
 ## 機能一覧
 
 ### 基本
@@ -33,6 +68,9 @@ v0.2 で**セキュリティ・堅牢性**、v0.3 で**同時接続・keep-alive
 | IPv6 デュアルスタック | `AF_INET6` + `IPV6_V6ONLY=0` で IPv4/IPv6 の両方を1つのソケットで受ける |
 | HTTP 解析 | リクエストライン（メソッド / パス / バージョン）をパース |
 | GET / HEAD / OPTIONS | HEAD は本文なし。OPTIONS は `Allow` を返す（204）|
+| リクエスト本文 | `Content-Length` と `Transfer-Encoding: chunked` の両方に対応 |
+| ディレクトリ | 末尾スラッシュへ 301、`index.html` を自動配信、一覧は明示的に許可した場合のみ |
+| gzip 圧縮 | `-DUSE_GZIP`。テキスト系のみ圧縮し、`Vary` と専用 ETag を付与 |
 | 静的ファイル配信 | `./www` 以下のファイルを返す |
 | Content-Type 判定 | 拡張子から MIME タイプを決定 |
 | URLデコード | `%20` などを復元 |
@@ -52,6 +90,8 @@ v0.2 で**セキュリティ・堅牢性**、v0.3 で**同時接続・keep-alive
 | **同時接続数の上限** | 現在の接続数をアトミックに数え、上限（既定 10000・環境変数 `TINYHTTPD_MAX_CONN` で変更可）を超えたら即クローズ |
 | **graceful shutdown** | `SIGINT`/`SIGTERM` で新規受付を止め、listen ソケットを閉じてから綺麗に終了。`SIGPIPE` は無視して送信中の切断で落ちない |
 | **権限降格 (POSIX)** | root で起動した場合、bind 後に `setgroups`/`setgid`/`setuid` で非特権ユーザ（既定 `nobody`）へ降格 |
+| **per-IP レート制限** | IP ごとのトークンバケット。バーストは許容しつつ継続的な高頻度アクセスを抑え、枯渇時は **429** と `Retry-After` を返す |
+| **Landlock サンドボックス** | Linux 5.13+ で、プロセスに「web root を読む以外できない」と宣言。パス検査をすり抜ける欠陥があってもカーネルが止める。起動時に `/` を開けないことを自己検証する |
 | **TLS / HTTPS** | OpenSSL による TLS 終端（コンパイル時オプション `-DUSE_TLS`。TLS1.2 以上のみ許可） |
 
 ### 高度な機能（v0.3〜0.4・すべてテスト済み）
@@ -77,7 +117,8 @@ v0.2 で**セキュリティ・堅牢性**、v0.3 で**同時接続・keep-alive
 | `GET /c:/windows/x` | 403 | ドライブ指定 |
 | `GET /nul` `/con` `/com1` | 403 | Windows予約デバイス名 |
 | `GET /escape/server.c`（junction経由）| 403 | ジャンクションによる webroot 脱出 |
-| `Transfer-Encoding: chunked` | 400 | リクエストスマグリング（TE.CL / CL.TE）|
+| `Transfer-Encoding` + `Content-Length` | 400 | リクエストスマグリング（TE.CL / CL.TE）|
+| `Transfer-Encoding: gzip` | 501 | 未対応の転送コーディング |
 | 1 MB 超の本文（`Content-Length`）| 413 | 巨大ボディによるワーカー占有 |
 | 8 KB 超のヘッダ | 431 | ヘッダあふれ |
 | 送信途中で沈黙 | 10 秒で切断 | Slowloris |
@@ -85,6 +126,17 @@ v0.2 で**セキュリティ・堅牢性**、v0.3 で**同時接続・keep-alive
 ## ビルドと実行
 
 ### 平文 HTTP（依存ライブラリなし）
+
+**Makefile を使う場合**
+```bash
+make            # 標準版
+make epoll      # C10K 版（Linux）
+make gzip       # gzip つき（要 zlib）
+make tls        # TLS つき（要 OpenSSL）
+make test       # 統合テスト
+make asan       # ASan/UBSan つきビルド
+make analyze    # 静的解析
+```
 
 **Windows（MinGW-w64 / gcc）**
 ```bash
@@ -100,6 +152,17 @@ gcc server.c -o server -lpthread
 ./server
 ```
 > `-lpthread` は同時接続（スレッド）のリンクに必要。
+
+### 設定（環境変数）
+
+| 変数 | 既定 | 意味 |
+|---|---|---|
+| `TINYHTTPD_MAX_CONN` | 10000 | 同時接続数の上限 |
+| `TINYHTTPD_RATE` | 50 | IP ごとの毎秒回復トークン数（レート制限）|
+| `TINYHTTPD_BURST` | 100 | IP ごとのトークン上限。`0` で制限を無効化 |
+| `TINYHTTPD_AUTOINDEX` | （無効）| `1` でディレクトリ一覧を有効化 |
+| `TINYHTTPD_SANDBOX` | （有効）| `0` で Landlock サンドボックスを無効化 |
+| `TINYHTTPD_USER` | `nobody` | root 起動時に降格する先のユーザ |
 
 ### HTTPS（TLS）を有効にする — OpenSSL が必要
 
@@ -157,6 +220,41 @@ gcc server.c -o server_epoll -DUSE_EPOLL -lpthread
 > ※このエディションは TLS 非対応（TLS はノンブロッキングなハンドシェイクが必要で、本エディションの
 > スコープ外）。`-DUSE_EPOLL` と `-DUSE_TLS` の同時指定はビルド時にエラーにしている。
 
+## 性能
+
+[`tests/loadtest.sh`](tests/loadtest.sh) による実測（WSL2 / 12 コア、web root はネイティブ ext4 上、
+`GET /` で 2.2KB の HTML を返す場合）。
+
+| 条件 | スループット | 平均 | p50 | p95 | p99 |
+|---|---|---|---|---|---|
+| 1 接続（レイテンシ測定）| 2,830 req/s | **0.25 ms** | 0.23 ms | 0.46 ms | 0.76 ms |
+| 50 接続 / thread-per-conn | 2,243 req/s | 19.9 ms | 17.4 ms | 45.4 ms | 63.5 ms |
+| 50 接続 / epoll + pool | 2,537 req/s | 17.2 ms | 14.6 ms | 39.3 ms | 54.8 ms |
+| 200 接続 / epoll + pool | 2,633 req/s | 26.1 ms | 21.4 ms | 63.2 ms | 89.4 ms |
+
+> 高同時接続でのスループットが頭打ちになっているのは、負荷をかけている側（python の
+> スレッドベースの計測スクリプト）が先に限界に達しているためで、サーバ側の上限ではない。
+> 純粋なサーバ性能として意味があるのは 1 接続時のレイテンシ（0.25 ms）の方。
+
+### 計測して見つけた性能バグ: Nagle と遅延 ACK
+
+最初の計測では **1 リクエストあたり約 43 ms** もかかっていた。同時接続数を増やしても
+1 リクエストの所要時間が変わらないことから、混雑ではなく固定の待ちだと分かった。
+
+原因は **Nagle アルゴリズムと遅延 ACK の相互作用**だった。このサーバは応答を
+「ヘッダを送る → 本文を送る」と 2 回に分けて書く。Nagle が有効だと 2 回目の小さな書き込みが
+相手の ACK を待って保留され、相手は相手で遅延 ACK で待つため、数十 ms の膠着が生じる。
+
+accept したソケットに `TCP_NODELAY` を設定して解消した。同一条件でこの 1 行だけを変えた比較:
+
+| | 平均レイテンシ | スループット |
+|---|---|---|
+| `TCP_NODELAY` なし | 43.2 ms | 23 req/s |
+| `TCP_NODELAY` あり | **0.23 ms** | **3,417 req/s** |
+
+レイテンシで約 188 倍。「動いている」ことと「速い」ことは別問題で、測らないと分からないという
+良い実例になった。
+
 ## 設計上の判断（面接で聞かれたら答えられるように）
 
 - **パス検査をなぜ三段構えにしたか**: 字句チェック（`..`/コロン/予約名 拒否）だけだと、シンボリックリンクや
@@ -212,6 +310,14 @@ gcc server.c -o server_epoll -DUSE_EPOLL -lpthread
 - [ ] gzip 圧縮（`Content-Encoding`）
 - [ ] アクセスログのファイル出力・ログレベル
 
+- **`TCP_NODELAY` を明示的に設定している理由**: 上の「計測して見つけた性能バグ」を参照。
+  応答を 2 回に分けて書く以上、Nagle は有害になる。
+- **gzip を全体一括で圧縮している理由**: ストリーミング圧縮にすると `Content-Length` を先に
+  決められず chunked 応答が必要になる。上限（4MB）を超えるものは圧縮せずゼロコピーで送る、
+  という単純な線引きにした。
+- **ディレクトリ一覧を既定で無効にした理由**: 中身の一覧は情報漏洩になりうるので、
+  明示的に `TINYHTTPD_AUTOINDEX=1` を指定したときだけ有効にしている（多くの実運用サーバと同じ既定）。
+
 ### 現状の既知の割り切り（正直に）
 - epoll 版のワーカーは「読み取り可能」通知を受けてから**ブロッキングで**1リクエストを読む
   （`recv` タイムアウトで上限あり）。完全なノンブロッキング状態機械ではないので、極端に遅い
@@ -224,18 +330,26 @@ gcc server.c -o server_epoll -DUSE_EPOLL -lpthread
 
 ## テスト / CI
 
-23 項目の統合テスト（[`tests/run_tests.sh`](tests/run_tests.sh)）を用意している。サーバをビルド・起動し、
-curl と raw ソケットで各レスポンス（200/204/206/304/400/403/404/405/413/416/431/505、multipart、
-条件付きGET、If-Range 等）を検証し、1件でも失敗すれば非ゼロ終了する。
-
 ```bash
-bash tests/run_tests.sh              # portable(thread-per-connection) 版
-USE_EPOLL=1 bash tests/run_tests.sh  # epoll(C10K) 版
+bash tests/run_tests.sh              # 統合テスト（42 項目）
+USE_EPOLL=1 bash tests/run_tests.sh  # epoll(C10K) 版に対して
+bash tests/fuzz.sh                   # 不正リクエストを大量に投げて落ちないか
+bash tests/loadtest.sh               # スループット / レイテンシ測定
 ```
 
-GitHub Actions（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）で、push / PR ごとに
-**portable・epoll・TLS の 3 構成をビルド**し、portable と epoll でこの統合テストを実行する。
-（TLS 構成は `libssl-dev` を入れてコンパイル可能かを検証する。）
+| スクリプト | 内容 |
+|---|---|
+| [`tests/run_tests.sh`](tests/run_tests.sh) | **42 項目**の統合テスト。curl と raw ソケットで、ステータス（200/204/206/301/304/400/403/404/405/413/416/429/431/501/505）、multipart/byteranges、条件付きGET、If-Range、chunked 本文、ディレクトリ、gzip、IPv6、レート制限を検証。1 件でも失敗すれば非ゼロ終了 |
+| [`tests/fuzz.sh`](tests/fuzz.sh) | ランダム・不正なリクエスト（壊れたメソッド／巨大ヘッダ／矛盾する長さ／ランダムバイト列）を大量に投げ、クラッシュしないことを確認。ASan/UBSan ビルドに対して実行すればメモリ破壊・未定義動作も検出する |
+| [`tests/loadtest.sh`](tests/loadtest.sh) | 同時接続を張ってスループットと p50/p95/p99 レイテンシを測る（外部ツール不要）|
+
+GitHub Actions（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）は push / PR ごとに以下を実行する。
+
+- **ビルド 5 構成**（portable / epoll / gzip / TLS / 全部入り）を `-Werror` で
+- **静的解析** `gcc -fanalyzer` を `-Werror` で（警告ゼロを維持）
+- **統合テスト**を portable と epoll の両方で
+- **ASan/UBSan** 下で統合テストとファジングを実行
+- **HTTPS の疎通確認**（自己署名証明書を作り、GET/POST/Range を TLS 越しに検証）
 
 ## ライセンス
 MIT
