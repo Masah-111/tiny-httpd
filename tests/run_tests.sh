@@ -91,6 +91,12 @@ check "TE: gzip            -> 501" 501 "$(raw_status 'POST /echo HTTP/1.1\r\nHos
 BIG="$(head -c 2000000 /dev/zero | curl -s -o /dev/null -w '%{http_code}' --data-binary @- $U/echo)"
 check "body 2MB            -> 413" 413 "$BIG"
 
+echo "== protocol version / Host =="
+check "HTTP/1.0 no Host    -> 200" 200 "$(raw_status 'GET / HTTP/1.0\r\n\r\n')"
+check "HTTP/1.1 no Host    -> 400" 400 "$(raw_status 'GET / HTTP/1.1\r\n\r\n')"
+check "duplicate Host      -> 400" 400 "$(raw_status 'GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n')"
+check "HTTP/3.0            -> 505" 505 "$(raw_status 'GET / HTTP/3.0\r\nHost: x\r\n\r\n')"
+
 echo "== parse hardening =="
 check "HTTP/2.0            -> 505" 505 "$(raw_status 'GET / HTTP/2.0\r\nHost: x\r\n\r\n')"
 check "bad method          -> 400" 400 "$(raw_status 'ge!t / HTTP/1.1\r\nHost: x\r\n\r\n')"

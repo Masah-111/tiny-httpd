@@ -562,6 +562,21 @@ static int header_get(const char *hdrs, const char *name, char *out, size_t outs
     return 0;
 }
 
+/* 指定したヘッダが何回現れるかを数える（Host の重複検出などに使う）*/
+static int header_count(const char *hdrs, const char *name) {
+    size_t nlen = strlen(name);
+    const char *p = hdrs;
+    int count = 0;
+    while (p && *p) {
+        if (p[0] == '\r' && p[1] == '\n') break;        /* ヘッダ終端 */
+        if (HDRNCMP(p, name, nlen) == 0 && p[nlen] == ':') count++;
+        const char *nl = strstr(p, "\r\n");
+        if (!nl) break;
+        p = nl + 2;
+    }
+    return count;
+}
+
 /* ヘッダブロックを厳格に検証する（不正リクエストを早期に弾く）。
  * 戻り値: 0=OK / 400=不正な行 / 431=ヘッダが多すぎ */
 static int validate_headers(const char *hdrs) {
@@ -1386,6 +1401,16 @@ static int handle_one_request(conn_t *c) {
     int vh = validate_headers(hdrs);
     if (vh) {
         send_error(c, vh, vh == 431 ? "Request Header Fields Too Large" : "Bad Request", 0);
+        return 0;
+    }
+
+    /* Host ヘッダの検証（RFC 7230 5.4）
+     * HTTP/1.1 では Host が必須で、無ければ 400 を返さなければならない。
+     * また、版に関わらず Host が複数あるのは不正（どの権威に向けた要求か曖昧になり、
+     * 前段と後段で解釈が割れるとリクエストスマグリングの足がかりにもなる）。 */
+    int host_count = header_count(hdrs, "Host");
+    if (host_count > 1 || (host_count == 0 && strcmp(version, "HTTP/1.1") == 0)) {
+        send_error(c, 400, "Bad Request", 0);
         return 0;
     }
 

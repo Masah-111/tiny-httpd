@@ -76,6 +76,7 @@ flowchart TD
 | URLデコード | `%20` などを復元 |
 | ステータス応答 | 200 / 204 / 206 / 304 / 400 / 403 / 404 / 405 / 413 / 416 / 431 / 505 |
 | 厳格なリクエスト検証 | 不正メソッド・非対応バージョン(505)・ヘッダ行数上限(431)・obs-fold や `:`欠落の行(400)を拒否 |
+| プロトコル版 | **HTTP/1.1** で応答。要求は HTTP/1.1 と HTTP/1.0 を受理し、それ以外は **505**。HTTP/1.1 で `Host` が無い、または `Host` が重複する要求は **400**（RFC 7230 5.4）|
 | Winsock / POSIX 両対応 | Windows でも Linux/macOS でも動く |
 
 ### セキュリティ・堅牢性（v0.2 で強化）
@@ -118,6 +119,7 @@ flowchart TD
 | `GET /nul` `/con` `/com1` | 403 | Windows予約デバイス名 |
 | `GET /escape/server.c`（junction経由）| 403 | ジャンクションによる webroot 脱出 |
 | `Transfer-Encoding` + `Content-Length` | 400 | リクエストスマグリング（TE.CL / CL.TE）|
+| `Host` ヘッダの重複 | 400 | どの権威宛か曖昧な要求（スマグリングの足がかり）|
 | `Transfer-Encoding: gzip` | 501 | 未対応の転送コーディング |
 | 1 MB 超の本文（`Content-Length`）| 413 | 巨大ボディによるワーカー占有 |
 | 8 KB 超のヘッダ | 431 | ヘッダあふれ |
@@ -324,6 +326,10 @@ accept したソケットに `TCP_NODELAY` を設定して解消した。同一�
   1リクエストは1ワーカーを一時占有しうる。ただし**待機接続はスレッドを消費しない**ので
   C10K の本質（大量のアイドル接続）は解決できている。
 - HTTP パイプライン（本文の後ろに次の要求を詰める）は未対応。
+- `Expect: 100-continue` は未対応。応答は常に `Content-Length` を付けるため、chunked の
+  「応答」は返さない（chunked の「要求本文」は解釈する）。
+- HTTP/2・HTTP/3 は非対応（505 を返す）。HTTP/2 はバイナリフレーミングと HPACK、
+  HTTP/3 は QUIC が土台で、1.1 の延長ではなく別実装になるため対象外にしている。
 - `Transfer-Encoding: chunked` のリクエスト本文は未対応（安全のため 400 で拒否）。
 - TLS はコンパイル時オプション（`-DUSE_TLS`）。WSL(OpenSSL 3.0) で **ビルド＆HTTPS を実機検証済み**（curl と **TLS 1.3** でハンドシェイクし、GET/POST/Range/条件付きGET が動作）。CI でもコンパイルを検証する。
 - epoll 版は Linux 専用・TLS 非対応（`kqueue`/IOCP と非ブロッキング TLS は今後）。
@@ -339,7 +345,7 @@ bash tests/loadtest.sh               # スループット / レイテンシ測�
 
 | スクリプト | 内容 |
 |---|---|
-| [`tests/run_tests.sh`](tests/run_tests.sh) | **42 項目**の統合テスト。curl と raw ソケットで、ステータス（200/204/206/301/304/400/403/404/405/413/416/429/431/501/505）、multipart/byteranges、条件付きGET、If-Range、chunked 本文、ディレクトリ、gzip、IPv6、レート制限を検証。1 件でも失敗すれば非ゼロ終了 |
+| [`tests/run_tests.sh`](tests/run_tests.sh) | **46 項目**の統合テスト。curl と raw ソケットで、ステータス（200/204/206/301/304/400/403/404/405/413/416/429/431/501/505）、multipart/byteranges、条件付きGET、If-Range、chunked 本文、ディレクトリ、gzip、IPv6、レート制限を検証。1 件でも失敗すれば非ゼロ終了 |
 | [`tests/fuzz.sh`](tests/fuzz.sh) | ランダム・不正なリクエスト（壊れたメソッド／巨大ヘッダ／矛盾する長さ／ランダムバイト列）を大量に投げ、クラッシュしないことを確認。ASan/UBSan ビルドに対して実行すればメモリ破壊・未定義動作も検出する |
 | [`tests/loadtest.sh`](tests/loadtest.sh) | 同時接続を張ってスループットと p50/p95/p99 レイテンシを測る（外部ツール不要）|
 
