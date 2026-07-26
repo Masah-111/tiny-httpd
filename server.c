@@ -1,20 +1,26 @@
 /*
- * tiny-httpd v0.3 : フレームワーク不使用・C言語で自作した HTTP/1.1 サーバ
+ * tiny-httpd : フレームワーク不使用・C言語で TCP ソケットから自作した HTTP/1.1 サーバ
  * ===========================================================================
- * v0.3 で追加した「本格機能」:
- *   (A) 同時接続対応   … 接続ごとにスレッドを起動（thread-per-connection）
- *   (B) keep-alive     … 1本の接続で複数リクエストを処理（HTTP/1.1 既定）
- *   (C) ボディ対応      … Content-Length を読み、POST /echo は本文をそのまま返す
- *   (D) キャッシュ      … ETag / Last-Modified と条件付きGET → 304 Not Modified
- *   (E) Range           … "Range: bytes=.." に 206 Partial Content で応答（動画等）
- *   (F) 標準ヘッダ       … Date / Server / Accept-Ranges / Connection など
- *   (G) ゼロコピー送信   … 平文・全体配信時のみ TransmitFile/sendfile（TLS時は通常送信）
+ * 機能:
+ *   通信      … IPv4/IPv6 デュアルスタック、keep-alive、リクエスト本文
+ *   配信      … 静的ファイル、条件付きGET(304)、Range(206、複数範囲も)、
+ *                ゼロコピー送信(TransmitFile / sendfile)、gzip(-DUSE_GZIP)
+ *   並行処理  … thread-per-connection、または epoll + スレッドプール(-DUSE_EPOLL)
+ *   暗号      … TLS(-DUSE_TLS、OpenSSL)
+ *   防御      … 三層パス検査、ヘッダ/本文サイズ上限、I/Oタイムアウト、
+ *                リクエストスマグリング拒否、per-IP レート制限、同時接続上限、
+ *                権限降格、Landlock サンドボックス(Linux)
+ *   運用      … graceful shutdown、Common Log Format のアクセスログ
  *
- * v0.2 からのセキュリティ(多層パス検査・サイズ制限・タイムアウト・TLS)も継続。
- * ビルド/実行/TLSは README.md 参照。
+ * ビルド方法・設計判断・既知の割り切りは README.md を参照。
  *
  * 作者: SATO MASAHIRO   ライセンス: MIT
  */
+
+/* glibc の拡張（O_PATH, timegm 等）を使うため、あらゆる include より前に定義する */
+#ifndef _WIN32
+  #define _GNU_SOURCE
+#endif
 
 /* ===== プラットフォーム差分の吸収 ===== */
 #ifdef _WIN32
@@ -62,6 +68,17 @@
 /* gzip 圧縮（zlib がある環境でのみ有効化するコンパイル時オプション）*/
 #ifdef USE_GZIP
   #include <zlib.h>
+#endif
+
+/* Landlock サンドボックス（Linux 5.13+）。ヘッダがある環境で自動的に有効化する。 */
+#if defined(__linux__) && defined(__has_include)
+  #if __has_include(<linux/landlock.h>)
+    #define HAVE_LANDLOCK 1
+    #include <linux/landlock.h>
+    #include <sys/syscall.h>
+    #include <sys/prctl.h>
+    #include <sys/vfs.h>          /* statfs: ファイルシステム種別の判定 */
+  #endif
 #endif
 
 #include <stdio.h>
@@ -118,6 +135,21 @@ static int        g_max_conns = 10000;        /* 同時接続の上限（環境�
 #else
   typedef struct stat stat_t;
   #define STAT_FN stat
+#endif
+
+/* ---------------------------------------------------------------------------
+ * ミューテックスの薄い抽象（Windows には pthread が無いため）
+ * ------------------------------------------------------------------------- */
+#ifdef _WIN32
+  typedef CRITICAL_SECTION mtx_t_;
+  static void mtx_init_(mtx_t_ *m)   { InitializeCriticalSection(m); }
+  static void mtx_lock_(mtx_t_ *m)   { EnterCriticalSection(m); }
+  static void mtx_unlock_(mtx_t_ *m) { LeaveCriticalSection(m); }
+#else
+  typedef pthread_mutex_t mtx_t_;
+  static void mtx_init_(mtx_t_ *m)   { pthread_mutex_init(m, NULL); }
+  static void mtx_lock_(mtx_t_ *m)   { pthread_mutex_lock(m); }
+  static void mtx_unlock_(mtx_t_ *m) { pthread_mutex_unlock(m); }
 #endif
 
 /* ===========================================================================
@@ -316,6 +348,59 @@ static void access_log(const char *ip, const char *method, const char *path,
     if (n > 0) { fwrite(line, 1, (size_t)n, stdout); fflush(stdout); }
 }
 
+/* ---------------------------------------------------------------------------
+ * per-IP レート制限（トークンバケット方式）
+ * ---------------------------------------------------------------------------
+ * 各 IP に「トークン」を持たせ、リクエストごとに 1 消費する。トークンは毎秒
+ * RATE_REFILL 個ずつ、上限 RATE_BURST まで回復する。空なら 429 を返す。
+ * これにより「短時間の集中アクセスは許すが、継続的な高頻度アクセスは抑える」
+ * という挙動になる（バースト許容つきの平滑化）。
+ * 固定サイズのハッシュ表で、衝突時は古いエントリを上書きする（メモリ上限を保証）。
+ * ------------------------------------------------------------------------- */
+#define RATE_SLOTS   1024      /* ハッシュ表のスロット数 */
+static double g_rate_refill = 50.0;   /* 1秒あたりの回復トークン数 */
+static double g_rate_burst  = 100.0;  /* 蓄積できるトークンの上限 */
+
+typedef struct {
+    char   ip[46];
+    double tokens;
+    time_t last;
+} rate_slot;
+static rate_slot g_rate[RATE_SLOTS];
+static mtx_t_    g_rate_mtx;
+
+static unsigned rate_hash(const char *s) {
+    unsigned h = 2166136261u;                 /* FNV-1a */
+    while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
+    return h;
+}
+
+/* 1リクエスト分のトークンを消費する。1=許可 / 0=拒否(429) */
+static int rate_allow(const char *ip) {
+    if (g_rate_burst <= 0) return 1;          /* 0 以下なら無効化 */
+    unsigned idx = rate_hash(ip) % RATE_SLOTS;
+    time_t now = time(NULL);
+    int ok;
+    mtx_lock_(&g_rate_mtx);
+    rate_slot *s = &g_rate[idx];
+    if (strcmp(s->ip, ip) != 0) {             /* 別 IP（初回 or 衝突）→ 作り直す */
+        snprintf(s->ip, sizeof s->ip, "%s", ip);
+        s->tokens = g_rate_burst;
+        s->last   = now;
+    } else {
+        double elapsed = difftime(now, s->last);
+        if (elapsed > 0) {
+            s->tokens += elapsed * g_rate_refill;
+            if (s->tokens > g_rate_burst) s->tokens = g_rate_burst;
+            s->last = now;
+        }
+    }
+    if (s->tokens >= 1.0) { s->tokens -= 1.0; ok = 1; }
+    else                    ok = 0;
+    mtx_unlock_(&g_rate_mtx);
+    return ok;
+}
+
 /* graceful shutdown: SIGINT/SIGTERM で受付を止める。listen ソケットを閉じて
  * accept() のブロックを解除する（close はシグナルハンドラで安全に呼べる）。 */
 static void on_signal(int sig) {
@@ -332,6 +417,98 @@ static void format_peer(const struct sockaddr_in6 *sa, char *out, size_t n) {
     if (strncmp(tmp, "::ffff:", 7) == 0) snprintf(out, n, "%s", tmp + 7);
     else                                 snprintf(out, n, "%s", tmp);
 }
+
+/* ---------------------------------------------------------------------------
+ * Landlock サンドボックス（Linux 5.13+）
+ * ---------------------------------------------------------------------------
+ * カーネルに「このプロセスは web root 配下を読むこと以外できない」と宣言する。
+ * 万一パス検査をすり抜ける欠陥があっても、カーネルがファイルアクセスを拒否するため、
+ * 被害を封じ込められる（多層防御の最後の砦）。
+ * 対応していないカーネルでは黙って無効になる（起動は妨げない）。
+ * ------------------------------------------------------------------------- */
+#ifdef HAVE_LANDLOCK
+static int landlock_create_ruleset_(const struct landlock_ruleset_attr *attr,
+                                    size_t size, __u32 flags) {
+    return (int)syscall(__NR_landlock_create_ruleset, attr, size, flags);
+}
+static int landlock_add_rule_(int fd, enum landlock_rule_type t,
+                              const void *attr, __u32 flags) {
+    return (int)syscall(__NR_landlock_add_rule, fd, t, attr, flags);
+}
+static int landlock_restrict_self_(int fd, __u32 flags) {
+    return (int)syscall(__NR_landlock_restrict_self, fd, flags);
+}
+
+static void sandbox_self(void) {
+    /* 明示的に無効化できる逃げ道（環境依存で不都合が出たとき用）*/
+    const char *opt = getenv("TINYHTTPD_SANDBOX");
+    if (opt && strcmp(opt, "0") == 0) { printf("sandbox: disabled by TINYHTTPD_SANDBOX=0\n"); return; }
+
+    /* v9fs（WSL の /mnt/c など Windows ドライブ共有）では path_beneath ルールが
+     * 正しく機能せず、許可したはずの web root まで読めなくなる。実測で確認済みなので、
+     * この種のファイルシステム上では適用を見送る（ネイティブ FS では有効のまま）。*/
+    struct statfs sfs;
+    if (statfs(g_webroot, &sfs) == 0 && (unsigned long)sfs.f_type == 0x01021997UL) {
+        printf("sandbox: skipped (web root is on v9fs; landlock cannot restrict it reliably)\n");
+        return;
+    }
+
+    /* カーネルが対応している Landlock の版を調べる（未対応なら諦める）*/
+    int abi = landlock_create_ruleset_(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION);
+    if (abi < 1) { printf("sandbox: landlock unavailable (skipped)\n"); return; }
+
+    /* この版で扱える権限をすべて掌握する（＝既定で全部禁止にする）*/
+    __u64 handled =
+        LANDLOCK_ACCESS_FS_EXECUTE    | LANDLOCK_ACCESS_FS_WRITE_FILE |
+        LANDLOCK_ACCESS_FS_READ_FILE  | LANDLOCK_ACCESS_FS_READ_DIR   |
+        LANDLOCK_ACCESS_FS_REMOVE_DIR | LANDLOCK_ACCESS_FS_REMOVE_FILE|
+        LANDLOCK_ACCESS_FS_MAKE_CHAR  | LANDLOCK_ACCESS_FS_MAKE_DIR   |
+        LANDLOCK_ACCESS_FS_MAKE_REG   | LANDLOCK_ACCESS_FS_MAKE_SOCK  |
+        LANDLOCK_ACCESS_FS_MAKE_FIFO  | LANDLOCK_ACCESS_FS_MAKE_BLOCK |
+        LANDLOCK_ACCESS_FS_MAKE_SYM;
+#ifdef LANDLOCK_ACCESS_FS_REFER
+    if (abi >= 2) handled |= LANDLOCK_ACCESS_FS_REFER;
+#endif
+#ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+    if (abi >= 3) handled |= LANDLOCK_ACCESS_FS_TRUNCATE;
+#endif
+
+    struct landlock_ruleset_attr rattr;
+    memset(&rattr, 0, sizeof rattr);
+    rattr.handled_access_fs = handled;
+    int rs = landlock_create_ruleset_(&rattr, sizeof rattr, 0);
+    if (rs < 0) { printf("sandbox: could not create ruleset (skipped)\n"); return; }
+
+    /* 例外として web root だけ「読む」ことを許可する */
+    struct landlock_path_beneath_attr pb;
+    memset(&pb, 0, sizeof pb);
+    pb.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+    pb.parent_fd = open(g_webroot, O_PATH | O_CLOEXEC);
+    if (pb.parent_fd < 0) { close(rs); printf("sandbox: cannot open web root (skipped)\n"); return; }
+    if (landlock_add_rule_(rs, LANDLOCK_RULE_PATH_BENEATH, &pb, 0) != 0) {
+        close(pb.parent_fd); close(rs);
+        printf("sandbox: could not add rule (skipped)\n"); return;
+    }
+    close(pb.parent_fd);
+
+    /* 以後 privilege を増やせないようにしてから、自分自身に制限を適用する */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 || landlock_restrict_self_(rs, 0) != 0) {
+        close(rs); printf("sandbox: could not apply (skipped)\n"); return;
+    }
+    close(rs);
+
+    /* 自己検証: web root の外（ルートディレクトリ）を開けないことを実際に確かめる。
+     * 「有効化したつもりで効いていない」状態を起動時に検出できる。 */
+    int probe = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (probe >= 0) {
+        close(probe);
+        printf("sandbox: WARNING - landlock applied but '/' is still readable\n");
+    } else {
+        printf("sandbox: landlock ABI v%d active "
+               "(verified: read-only, confined to web root)\n", abi);
+    }
+}
+#endif /* HAVE_LANDLOCK */
 
 /* 権限降格: root で起動された場合、bind 後に非特権ユーザへ降格する（POSIX のみ）。
  * 万一の脆弱性が root 権限で悪用されるのを防ぐ、Web サーバの定石。 */
@@ -1008,6 +1185,24 @@ static int handle_one_request(conn_t *c) {
         else if (HDRNCMP(conval, "keep-alive", 10) == 0) keep_alive = 1;
     }
 
+    /* --- per-IP レート制限 → 429 Too Many Requests --- */
+    if (!rate_allow(c->ip)) {
+        char d[64]; http_date(time(NULL), d, sizeof d);
+        const char *b429 = "<!doctype html><meta charset=\"utf-8\"><title>429</title>"
+                           "<h1>429 Too Many Requests</h1>";
+        char h[384];
+        int hl = snprintf(h, sizeof h,
+            "HTTP/1.1 429 Too Many Requests\r\nDate: %s\r\nServer: %s\r\n"
+            "Retry-After: 1\r\nContent-Type: text/html; charset=utf-8\r\n"
+            "Content-Length: %d\r\n%s\r\n",
+            d, SERVER_NAME, (int)strlen(b429), conn_hdr(keep_alive));
+        conn_send_all(c, h, (size_t)hl);
+        conn_send_all(c, b429, strlen(b429));
+        access_log(c->ip, method, raw_path, version, 429);
+        c->reqcount++;
+        return keep_alive && c->reqcount < MAX_REQUESTS_PER_CONN;
+    }
+
     /* --- リクエストスマグリング対策: Transfer-Encoding は未対応なので拒否 ---
      * chunked を誤って処理したり、Content-Length と併存させると
      * リクエストスマグリングの温床になる。安全側に倒して 400 で接続を閉じる。 */
@@ -1367,13 +1562,28 @@ int main(int argc, char **argv) {
     drop_privileges();                           /* root 起動なら bind 後に非特権ユーザへ降格 */
 #endif
 
-    /* --- 同時接続の上限（環境変数 TINYHTTPD_MAX_CONN で変更可）--- */
+    /* --- 上限値の設定（環境変数で変更可）--- */
     { const char *m = getenv("TINYHTTPD_MAX_CONN"); if (m) { int v = atoi(m); if (v > 0) g_max_conns = v; } }
+    { const char *r = getenv("TINYHTTPD_RATE");    if (r) g_rate_refill = atof(r); }
+    { const char *b = getenv("TINYHTTPD_BURST");   if (b) g_rate_burst  = atof(b); }
+    mtx_init_(&g_rate_mtx);
+    memset(g_rate, 0, sizeof g_rate);
+
+    /* --- サンドボックス: 以後は web root を読む以外できないようにする --- */
+#ifdef HAVE_LANDLOCK
+    sandbox_self();
+#endif
 
     printf("tiny-httpd v0.4 listening on %s://[::]:%d/ (IPv4+IPv6)  (root: %s)\n",
            g_use_tls ? "https" : "http", port, g_webroot);
-    printf("features: keep-alive / body / cache-304 / range-206 / zero-copy / max-conn=%d\n", g_max_conns);
+    printf("features: keep-alive / cache-304 / range-206 / zero-copy"
+#ifdef USE_GZIP
+           " / gzip"
+#endif
+           " | max-conn=%d, rate=%.0f/s burst=%.0f\n",
+           g_max_conns, g_rate_refill, g_rate_burst);
     printf("SIGINT/SIGTERM to stop gracefully.\n");
+    fflush(stdout);   /* ログをファイルへリダイレクトしても起動状況がすぐ見えるように */
 
 #if defined(__linux__) && defined(USE_EPOLL)
     /* C10K エディション: epoll + スレッドプール */
