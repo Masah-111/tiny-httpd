@@ -50,6 +50,7 @@
   #include <errno.h>
   #include <pwd.h>              /* 権限降格（getpwnam）*/
   #include <grp.h>             /* setgroups / setgid */
+  #include <dirent.h>          /* ディレクトリ一覧（opendir / readdir）*/
   #ifdef __linux__
     #include <sys/sendfile.h>   /* sendfile（ゼロコピー）*/
   #endif
@@ -938,6 +939,105 @@ static int send_multirange(conn_t *c, openfile_t *of, range_t *r, int n,
     return 206;
 }
 
+/* ---------------------------------------------------------------------------
+ * ディレクトリの扱い
+ * ------------------------------------------------------------------------- */
+/* 通常ファイルとして安全に開けるか（存在確認）。開けたら閉じて 1 を返す。 */
+static int secure_open_exists(const char *path) {
+    openfile_t of;
+    if (secure_open(path, &of) != 0) return 0;
+    of_close(&of);
+    return 1;
+}
+
+static int is_directory(const char *path) {
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(path);
+    return (a != INVALID_FILE_ATTRIBUTES) && (a & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+/* HTML に出す文字列をエスケープする（ファイル名経由の XSS を防ぐ）*/
+static void html_escape(const char *in, char *out, size_t n) {
+    size_t o = 0;
+    for (size_t i = 0; in[i] && o + 7 < n; i++) {
+        switch (in[i]) {
+            case '&':  memcpy(out + o, "&amp;",  5); o += 5; break;
+            case '<':  memcpy(out + o, "&lt;",   4); o += 4; break;
+            case '>':  memcpy(out + o, "&gt;",   4); o += 4; break;
+            case '"':  memcpy(out + o, "&quot;", 6); o += 6; break;
+            case '\'': memcpy(out + o, "&#39;",  5); o += 5; break;
+            default:   out[o++] = in[i];
+        }
+    }
+    out[o] = '\0';
+}
+
+/* ディレクトリ一覧を HTML で返す（既定は無効。TINYHTTPD_AUTOINDEX=1 で有効）。
+ * 一覧表示は中身を晒す機能なので、明示的に有効化したときだけ動かす。 */
+static int serve_directory(conn_t *c, const char *fs_path, const char *url_path,
+                           int head_only, int keep_alive) {
+    char *body = (char *)malloc(64 * 1024);
+    if (!body) { send_error(c, 500, "Internal Server Error", keep_alive); return 500; }
+    size_t cap = 64 * 1024, len = 0;
+    char esc_url[2100];
+    html_escape(url_path, esc_url, sizeof esc_url);
+
+    len += (size_t)snprintf(body + len, cap - len,
+        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">"
+        "<title>Index of %s</title>"
+        "<style>body{font-family:system-ui,sans-serif;margin:40px;}"
+        "h1{font-size:1.2rem}a{text-decoration:none}li{margin:.2rem 0}</style>"
+        "<h1>Index of %s</h1><ul>", esc_url, esc_url);
+    if (strcmp(url_path, "/") != 0)
+        len += (size_t)snprintf(body + len, cap - len, "<li><a href=\"../\">../</a></li>");
+
+    int n = 0;
+#ifdef _WIN32
+    char pat[PATH_BUF];
+    snprintf(pat, sizeof pat, "%s\\*", fs_path);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+            int dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            char esc[600]; html_escape(fd.cFileName, esc, sizeof esc);
+            if (cap - len < 800) break;
+            len += (size_t)snprintf(body + len, cap - len,
+                "<li><a href=\"%s%s\">%s%s</a></li>", esc, dir ? "/" : "", esc, dir ? "/" : "");
+            n++;
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+#else
+    DIR *d = opendir(fs_path);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            char full[PATH_BUF];
+            snprintf(full, sizeof full, "%s/%s", fs_path, e->d_name);
+            int dir = is_directory(full);
+            char esc[600]; html_escape(e->d_name, esc, sizeof esc);
+            if (cap - len < 800) break;
+            len += (size_t)snprintf(body + len, cap - len,
+                "<li><a href=\"%s%s\">%s%s</a></li>", esc, dir ? "/" : "", esc, dir ? "/" : "");
+            n++;
+        }
+        closedir(d);
+    }
+#endif
+    (void)n;
+    len += (size_t)snprintf(body + len, cap - len, "</ul><hr><p>%s</p></html>", SERVER_NAME);
+    send_simple(c, 200, "OK", "text/html; charset=utf-8", body, len, keep_alive, head_only);
+    free(body);
+    return 200;
+}
+
 static int serve_file(conn_t *c, const char *fs_path, const char *hdrs,
                       int head_only, int keep_alive) {
     openfile_t of;
@@ -1134,6 +1234,106 @@ static void read_body(conn_t *c, const char *already, size_t already_len,
 }
 
 /* ---------------------------------------------------------------------------
+ * chunked 本文の読み取り。
+ *   "<16進の長さ>[;拡張]\r\n<データ>\r\n" を繰り返し、長さ 0 で終端。
+ * capture!=0 なら中身を最大 ECHO_CAP バイトまで集める。
+ * 戻り値: 0=正常終了 / -1=壊れている(400) / -2=大きすぎる(413)
+ * ------------------------------------------------------------------------- */
+static int read_chunked_body(conn_t *c, const char *already, size_t already_len,
+                             int capture, char **out, size_t *out_len) {
+    *out = NULL; *out_len = 0;
+    char *buf = capture ? (char *)malloc(ECHO_CAP + 1) : NULL;
+    size_t collected = 0, total = 0;
+
+    /* ヘッダ読み込み時に先読みしていた分を、そのまま解析の先頭に使う。
+     * 先読み分は最大 REQ_BUF_SIZE バイトになり得るので、作業窓はそれより大きく取る
+     * （小さいと先読みデータを取りこぼして本文が壊れる）。 */
+    char win[REQ_BUF_SIZE * 2];
+    if (already_len > sizeof(win)) { if (buf) free(buf); return -1; }
+    size_t wlen = already_len;
+    if (wlen) memcpy(win, already, wlen);
+
+    /* win に最低 need バイト溜まるまで読み足す。0=成功 / -1=切断 */
+    #define FILL(need) do { \
+        while (wlen < (size_t)(need)) { \
+            if (wlen >= sizeof(win)) { if (buf) free(buf); return -1; } \
+            int _n = conn_recv(c, win + wlen, (int)(sizeof(win) - wlen)); \
+            if (_n <= 0) { if (buf) free(buf); return -1; } \
+            wlen += (size_t)_n; \
+        } \
+    } while (0)
+    /* win の先頭 k バイトを捨てる */
+    #define DROP(k) do { memmove(win, win + (k), wlen - (k)); wlen -= (k); } while (0)
+
+    for (;;) {
+        /* --- チャンクサイズ行を見つける --- */
+        char *nl = NULL;
+        for (;;) {
+            nl = (char *)memchr(win, '\n', wlen);
+            if (nl) break;
+            if (wlen >= sizeof(win)) { if (buf) free(buf); return -1; }
+            int n = conn_recv(c, win + wlen, (int)(sizeof(win) - wlen));
+            if (n <= 0) { if (buf) free(buf); return -1; }
+            wlen += (size_t)n;
+        }
+        size_t line_len = (size_t)(nl - win) + 1;
+        char sizebuf[32];
+        size_t cp = (line_len < sizeof(sizebuf)) ? line_len : sizeof(sizebuf) - 1;
+        memcpy(sizebuf, win, cp); sizebuf[cp] = '\0';
+
+        char *endp = NULL;
+        long long csize = strtoll(sizebuf, &endp, 16);      /* 16 進数 */
+        if (endp == sizebuf || csize < 0) { if (buf) free(buf); return -1; }
+        DROP(line_len);
+
+        if (csize == 0) break;                              /* 終端チャンク */
+
+        total += (size_t)csize;
+        if ((long long)total > MAX_BODY_SIZE) { if (buf) free(buf); return -2; }
+
+        /* --- データ本体 + 末尾の CRLF を読む --- */
+        long long remain = csize;
+        while (remain > 0) {
+            if (wlen == 0) {
+                int n = conn_recv(c, win, (int)sizeof(win));
+                if (n <= 0) { if (buf) free(buf); return -1; }
+                wlen = (size_t)n;
+            }
+            size_t take = (wlen < (size_t)remain) ? wlen : (size_t)remain;
+            if (buf && collected < ECHO_CAP) {
+                size_t room = ECHO_CAP - collected;
+                size_t k = take < room ? take : room;
+                memcpy(buf + collected, win, k); collected += k;
+            }
+            DROP(take);
+            remain -= (long long)take;
+        }
+        FILL(2); DROP(2);                                   /* データ後の CRLF */
+    }
+
+    /* --- トレーラ（あれば）を空行まで読み飛ばす --- */
+    for (;;) {
+        char *nl = (char *)memchr(win, '\n', wlen);
+        if (!nl) {
+            if (wlen >= sizeof(win)) break;
+            int n = conn_recv(c, win + wlen, (int)(sizeof(win) - wlen));
+            if (n <= 0) break;
+            wlen += (size_t)n;
+            continue;
+        }
+        size_t line_len = (size_t)(nl - win) + 1;
+        int empty = (line_len <= 2);                        /* "\r\n" or "\n" */
+        DROP(line_len);
+        if (empty) break;
+    }
+    #undef FILL
+    #undef DROP
+
+    if (buf) { buf[collected] = '\0'; *out = buf; *out_len = collected; }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
  * 1本の接続を処理（(A)スレッド内で呼ばれ、(B)keep-alive で複数回ループ）
  * ------------------------------------------------------------------------- */
 /* リクエストを1つ処理する。両方式（thread-per-conn / epoll+pool）が共有する中核。
@@ -1203,24 +1403,29 @@ static int handle_one_request(conn_t *c) {
         return keep_alive && c->reqcount < MAX_REQUESTS_PER_CONN;
     }
 
-    /* --- リクエストスマグリング対策: Transfer-Encoding は未対応なので拒否 ---
-     * chunked を誤って処理したり、Content-Length と併存させると
-     * リクエストスマグリングの温床になる。安全側に倒して 400 で接続を閉じる。 */
+    /* --- 本文の枠組み（フレーミング）を決める ---
+     * Transfer-Encoding と Content-Length が両方あると、前段と後段で本文の境界の
+     * 解釈がずれる「リクエストスマグリング」の温床になる。RFC どおり両立は拒否する。 */
     char tebuf[64];
-    if (header_get(hdrs, "Transfer-Encoding", tebuf, sizeof tebuf)) {
-        send_error(c, 400, "Bad Request", 0);
-        return 0;
-    }
-
-    /* --- (C) Content-Length を見て本文を読む（フレーミング維持に必須）--- */
     long long clen = -1;
     char clbuf[32];
-    if (header_get(hdrs, "Content-Length", clbuf, sizeof clbuf)) clen = atoll(clbuf);
+    int has_cl = header_get(hdrs, "Content-Length", clbuf, sizeof clbuf);
+    int chunked = 0;
 
-    /* 本文サイズの上限（巨大 Content-Length でワーカーを占有させない）→ 413 */
-    if (clen > MAX_BODY_SIZE) {
-        send_error(c, 413, "Payload Too Large", 0);   /* フレーミング不明なので閉じる */
-        return 0;
+    if (header_get(hdrs, "Transfer-Encoding", tebuf, sizeof tebuf)) {
+        if (has_cl) { send_error(c, 400, "Bad Request", 0); return 0; }   /* TE + CL 併存 */
+        if (HDRNCMP(tebuf, "chunked", 7) != 0) {                          /* chunked 以外は非対応 */
+            send_error(c, 501, "Not Implemented", 0); return 0;
+        }
+        chunked = 1;
+    } else if (has_cl) {
+        clen = atoll(clbuf);
+        if (clen < 0) { send_error(c, 400, "Bad Request", 0); return 0; }
+        /* 本文サイズの上限（巨大 Content-Length でワーカーを占有させない）→ 413 */
+        if (clen > MAX_BODY_SIZE) {
+            send_error(c, 413, "Payload Too Large", 0);   /* フレーミング不明なので閉じる */
+            return 0;
+        }
     }
 
     int is_get     = (strcmp(method, "GET") == 0);
@@ -1235,7 +1440,16 @@ static int handle_one_request(conn_t *c) {
 
     int want_echo = (is_post && decode_ok && strcmp(path, "/echo") == 0);
     char  *body = NULL; size_t body_len = 0;
-    read_body(c, body_in_buf, body_buffered, clen, want_echo, &body, &body_len);
+    if (chunked) {
+        int rc = read_chunked_body(c, body_in_buf, body_buffered, want_echo, &body, &body_len);
+        if (rc != 0) {                                  /* 壊れた/大きすぎる本文 */
+            if (rc == -2) send_error(c, 413, "Payload Too Large", 0);
+            else          send_error(c, 400, "Bad Request", 0);
+            return 0;                                   /* フレーミング不明なので閉じる */
+        }
+    } else {
+        read_body(c, body_in_buf, body_buffered, clen, want_echo, &body, &body_len);
+    }
 
     int status = 0;
 
@@ -1249,7 +1463,6 @@ static int handle_one_request(conn_t *c) {
         if (unsafe) {
             send_error(c, 403, "Forbidden", keep_alive); status = 403;
         } else {
-            if (!strcmp(path, "/")) strcpy(path, "/index.html");
             char fs_path[PATH_BUF];
             snprintf(fs_path, sizeof fs_path, "%s%s", WEB_ROOT, path);
             char resolved[PATH_BUF];
@@ -1257,6 +1470,33 @@ static int handle_one_request(conn_t *c) {
                 send_error(c, 404, "Not Found", keep_alive); status = 404;
             } else if (!within_webroot(resolved)) {
                 send_error(c, 403, "Forbidden", keep_alive); status = 403;
+            } else if (is_directory(resolved)) {
+                size_t plen = strlen(path);
+                if (plen == 0 || path[plen - 1] != '/') {
+                    /* ディレクトリは末尾 '/' に正規化する（相対リンクが壊れないように）*/
+                    char d[64]; http_date(time(NULL), d, sizeof d);
+                    char h[2400];
+                    int hl = snprintf(h, sizeof h,
+                        "HTTP/1.1 301 Moved Permanently\r\nDate: %s\r\nServer: %s\r\n"
+                        "Location: %s/\r\nContent-Length: 0\r\n%s\r\n",
+                        d, SERVER_NAME, path, conn_hdr(keep_alive));
+                    conn_send_all(c, h, (size_t)hl); status = 301;
+                } else {
+                    /* index.html があればそれを返し、無ければ（許可時のみ）一覧表示 */
+                    char idx[PATH_BUF];
+                    size_t rlen = strlen(resolved);
+                    const char *sep = (rlen && resolved[rlen - 1] == '/') ? "" : "/";
+                    int need = snprintf(idx, sizeof idx, "%s%sindex.html", resolved, sep);
+                    int idx_ok = (need > 0 && (size_t)need < sizeof idx);  /* 切り詰めなら無効 */
+                    const char *ai = getenv("TINYHTTPD_AUTOINDEX");
+                    if (idx_ok && secure_open_exists(idx)) {
+                        status = serve_file(c, idx, hdrs, is_head, keep_alive);
+                    } else if (ai && strcmp(ai, "1") == 0) {
+                        status = serve_directory(c, resolved, path, is_head, keep_alive);
+                    } else {
+                        send_error(c, 403, "Forbidden", keep_alive); status = 403;
+                    }
+                }
             } else {
                 status = serve_file(c, resolved, hdrs, is_head, keep_alive);
             }
