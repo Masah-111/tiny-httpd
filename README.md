@@ -1,5 +1,9 @@
 # tiny-httpd
 
+[![CI](https://github.com/Masah-111/tiny-httpd/actions/workflows/ci.yml/badge.svg)](https://github.com/Masah-111/tiny-httpd/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![C](https://img.shields.io/badge/C-standard%20library%20only-555.svg)](server.c)
+
 **フレームワークを使わず、C言語で TCP ソケットから自作した HTTP/1.1 静的ファイルサーバ。**
 Apache や nginx が内部で何をしているのかを、標準ライブラリだけで手を動かして理解するために作りました。
 v0.2 で**セキュリティ・堅牢性**、v0.3 で**同時接続・keep-alive・キャッシュ・Range・ゼロコピー**まで実装し、
